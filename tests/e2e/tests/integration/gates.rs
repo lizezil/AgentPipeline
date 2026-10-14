@@ -60,7 +60,7 @@ fn write_verbose_gate(flow: &Flow, name: &str, fail_on: &[u32], middle_marker: &
 /// 把项目 test_framework 换成状态化闸门命令。
 async fn set_test_framework(flow: &Flow, command: &str) {
     flow.store
-        .update_project("p1", None, None, Some(command), None)
+        .update_project("p1", None, None, Some(command), None, None)
         .await
         .unwrap();
 }
@@ -416,7 +416,7 @@ async fn e2e_07_merge_lint_gate_failure_kicks_back_develop_without_test() {
     // lint 第 1 次（develop 闸门）通过，第 2 次（merge 闸门）失败
     let lint = write_stateful_gate(&f, "lint", &[2], "LINT_FAIL: unused import");
     f.store
-        .update_project("p1", None, None, None, Some(&lint))
+        .update_project("p1", None, None, None, Some(&lint), None)
         .await
         .unwrap();
 

@@ -173,7 +173,7 @@ impl Store {
         rows.into_iter().map(ProjectRow::into_project).collect()
     }
 
-    /// `PATCH /projects/{id}`（决策 101）。
+    /// `PATCH /projects/{id}`（决策 101；`local_path` 由决策 422② 票 deploy-divergence/03 加）。
     #[allow(clippy::too_many_arguments)]
     pub async fn update_project(
         &self,
@@ -182,6 +182,7 @@ impl Store {
         default_branch: Option<&str>,
         test_framework: Option<&str>,
         lint_command: Option<&str>,
+        local_path: Option<&str>,
     ) -> Result<()> {
         if let Some(v) = name {
             sqlx::query("UPDATE kanban_projects SET name = ? WHERE id = ?")
@@ -206,6 +207,15 @@ impl Store {
         }
         if let Some(v) = lint_command {
             sqlx::query("UPDATE kanban_projects SET lint_command = ? WHERE id = ?")
+                .bind(v)
+                .bind(project_id)
+                .execute(self.pool())
+                .await?;
+        }
+        // 改指：值已在路由层过完三项校验（目录在 / 是 git 仓 / 有提交）——
+        // 这里只落库，校验单点不复做。
+        if let Some(v) = local_path {
+            sqlx::query("UPDATE kanban_projects SET local_path = ? WHERE id = ?")
                 .bind(v)
                 .bind(project_id)
                 .execute(self.pool())

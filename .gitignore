@@ -23,9 +23,10 @@ crates/desktop/gen/schemas/
 # 过程草稿区（.scratch/）：截图、审计、issue、临时笔记等，整体不入库
 .scratch/
 
-# 本机工具产物，与本项目无关：cargo-sweep 的时间戳文件、ZCode 客户端的会话目录
+# 本机工具产物，与本项目无关：cargo-sweep 的时间戳文件、ZCode 客户端的会话目录、Qoder 项目级 skill
 sweep.timestamp
 .zcode/
+.qoder/
 
 __pycache__/
 /.target/

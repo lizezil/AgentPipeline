@@ -1536,6 +1536,90 @@ async fn project_creation_rejects_non_git_and_delete_refuses_active_tasks() {
 }
 
 #[tokio::test]
+async fn project_patch_local_path_rejects_bad_targets_and_repoints_when_valid() {
+    let api = api().await;
+    let (status, body) = post(
+        &api,
+        "/projects",
+        serde_json::json!({"name": "示例", "local_path": api._repo.path().display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let project_id = body["project"]["id"].as_str().unwrap().to_string();
+
+    // ① 非目录拒——与 create 同款校验（决策 61 / 101），改指同样不许指到不存在的地方
+    let (status, body) = patch(
+        &api,
+        &format!("/projects/{project_id}"),
+        serde_json::json!({"local_path": "/definitely/not/a/dir-xyz"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("不是目录"),
+        "{body}"
+    );
+
+    // ② 非 git 仓拒
+    let plain = api._home.scratch_dir("patch-not-a-repo");
+    let (status, body) = patch(
+        &api,
+        &format!("/projects/{project_id}"),
+        serde_json::json!({"local_path": plain.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("不是 git 仓库"),
+        "{body}"
+    );
+
+    // ③ unborn HEAD 拒——有仓无提交的仓库纳不进流水线，创建与改指同款
+    let unborn = Repo::unborn_head().unwrap();
+    let (status, body) = patch(
+        &api,
+        &format!("/projects/{project_id}"),
+        serde_json::json!({"local_path": unborn.path().display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("unborn HEAD"),
+        "{body}"
+    );
+
+    // ④ 合法改指落库（票 deploy-divergence/03 的迁移入口：106 改指独立克隆）
+    let other = Repo::clean().unwrap();
+    let (status, body) = patch(
+        &api,
+        &format!("/projects/{project_id}"),
+        serde_json::json!({"local_path": other.path().display().to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["project"]["local_path"],
+        other.path().display().to_string(),
+        "{body}"
+    );
+
+    // 其余字段的既有改法不受影响
+    let (status, body) = patch(
+        &api,
+        &format!("/projects/{project_id}"),
+        serde_json::json!({"name": "改名"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["project"]["name"], "改名");
+    assert_eq!(
+        body["project"]["local_path"],
+        other.path().display().to_string(),
+        "改名不该动 local_path：{body}"
+    );
+}
+
+#[tokio::test]
 async fn project_analyze_is_async_and_pollable() {
     let api = api().await;
     let (_, body) = post(

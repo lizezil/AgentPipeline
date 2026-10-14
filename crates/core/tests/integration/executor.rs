@@ -3838,6 +3838,7 @@ async fn a_failing_test_command_kicks_develop_validate_output_back_and_leaves_th
             None,
             Some(&format!("sh {}", gate.display())),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4026,6 +4027,7 @@ async fn a_recovered_test_command_run_proceeds_past_develop_to_merge_approval() 
             None,
             None,
             Some(&format!("sh {}", gate.display())),
+            None,
             None,
         )
         .await
@@ -4274,6 +4276,7 @@ async fn merge_gate_failure_routes_to_test_recheck_then_reruns_gate() {
             None,
             None,
             Some(&format!("sh {}", gate.display())),
+            None,
             None,
         )
         .await

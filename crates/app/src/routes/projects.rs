@@ -27,30 +27,38 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<impl IntoResponse>
     Ok(Json(json!({ "projects": projects })))
 }
 
+/// 创建与改指（`PATCH local_path`）共用的三项校验（决策 61）：目录在、是 git 仓、有提交。
+/// 同一条规则只有一份——改指指到一个坏路径的后果与创建时指错一样（修复轮、worktree
+/// 全都锚定 `local_path`，票 deploy-divergence/03 的迁移走的就是这条改指路）。
+async fn validate_local_path(path: &std::path::Path) -> ApiResult<()> {
+    if !path.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "本地路径不存在或不是目录：{}",
+            path.display()
+        )));
+    }
+    if !Git.is_git_repo(path).await {
+        return Err(ApiError::bad_request(format!(
+            "不是 git 仓库，拒绝注册项目：{}",
+            path.display()
+        )));
+    }
+    if Git.unborn_head(path).await.map_err(map_core_error)? {
+        return Err(ApiError::bad_request(format!(
+            "仓库尚无任何提交（unborn HEAD），无法纳入流水线：{}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// `POST /projects`：**立即校验是否为 git 仓库**（决策 61）。
 pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateProject>,
 ) -> ApiResult<impl IntoResponse> {
     let path = std::path::PathBuf::from(&body.local_path);
-    if !path.is_dir() {
-        return Err(ApiError::bad_request(format!(
-            "本地路径不存在或不是目录：{}",
-            body.local_path
-        )));
-    }
-    if !Git.is_git_repo(&path).await {
-        return Err(ApiError::bad_request(format!(
-            "不是 git 仓库，拒绝创建项目：{}",
-            body.local_path
-        )));
-    }
-    if Git.unborn_head(&path).await.map_err(map_core_error)? {
-        return Err(ApiError::bad_request(format!(
-            "仓库尚无任何提交（unborn HEAD），无法纳入流水线：{}",
-            body.local_path
-        )));
-    }
+    validate_local_path(&path).await?;
 
     let language = Git::detect_language(&path);
     let project = Project {
@@ -86,6 +94,10 @@ pub struct PatchProject {
     pub default_branch: Option<String>,
     pub test_framework: Option<String>,
     pub lint_command: Option<String>,
+    /// 改指仓库（票 deploy-divergence/03 的迁移入口：106 把 `local_path` 从部署检出
+    /// 改指独立克隆）。校验与创建同款三项——`local_path` 是修复轮、worktree、合入的
+    /// 锚点，指错的后果与创建时指错一样。
+    pub local_path: Option<String>,
 }
 
 /// `PATCH /projects/{id}`（决策 101）。
@@ -103,6 +115,10 @@ pub async fn patch(
     {
         return Err(ApiError::not_found(format!("项目不存在：{id}")));
     }
+    // 改指在动库之前过与创建同款的三项校验——先拒后写，不落半条坏路径。
+    if let Some(local_path) = &body.local_path {
+        validate_local_path(std::path::Path::new(local_path)).await?;
+    }
     state
         .store
         .update_project(
@@ -111,6 +127,7 @@ pub async fn patch(
             body.default_branch.as_deref(),
             body.test_framework.as_deref(),
             body.lint_command.as_deref(),
+            body.local_path.as_deref(),
         )
         .await
         .map_err(map_core_error)?;
