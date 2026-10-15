@@ -3567,3 +3567,24 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **波及面**：`AGENTS.md` 与 `docs/README.md` 的决策计数 #1–432 → #1–433（后者此前停在 430，一并纠正）；`docs/testing.md` 用例目录加「终态 worktree 的产物回收」一行；`frontend/src/api/types.ts` 登记事件契约（加性，`reduce.ts` 与 `notificationPolicy.ts` 各走自己的 `default` 分支）。**现场欠账已在票 11 清掉**（那个 2.8GB 目录 2026-10-04 手工删除并归档任务），本票交付的是「下次不需要人动手」的那一半。
 
 **来源**：票 `106-stability/07`；决策 377②（本票的授权裁决原文）、3（终态删 worktree 的既定策略，本条补它没删成时的退路）、212（修复 worktree 回收的相邻面）、328（删项目时的磁盘产物回收，同一姿态）、321（`io_budget` 的水位快照）、209（读不到就降级、不许挂住关键路径）、249 / 352（事件形状唯一出口）、258（不写平行清单）、395（符号链接不追）、431 / 432（同票组另一半）；证据 `.scratch/monitor-01M3X472FJF8NW9082K6BFZPKC.md` 第二~七次巡检、票 11 的实测 `df`（69% → 61%）。
+
+### 决策 434 · 部署通路整体留在了旧远端上：换 GitHub 仓是一次部署动作，不是一次 git config（2026-10-15 运维收口）
+
+**起因**：本轮票 06 / 07 推上去之后 `check` 四杆全绿（run `38700849471`，`d10f79d`），`deploy-106` 的**两道闸也都过了**（结论 success + 被验 commit 是 main 尖端），job 真起来却在第二步当场挂：`/home/runner/.ssh/config line 2: no argument after keyword "hostname"`——`HostName ${{ secrets.DEPLOY_HOST }}` 与 `User ${{ secrets.DEPLOY_USER }}` 展开成了空串。往前翻，`lizezil/AgentPipeline` 的 `deploy-106` 一共三条 run（两条 failure、一条 skipped），**从没成过**；而 §12.18 记载的那次成功接力（run `36658496820`，部 `5e42661`，2026-09-30）属于**另一个仓** `745846739/AgentPipeline`。本地 `origin` 在 10-12 前后从旧仓换到了 `lizezil`（新仓历史正是从旧仓尖端 `a67a97e` 往下长的），**这次换远端没写进任何文档**，也没人跟着搬两样必需的东西：仓库的 Actions secrets（新仓列表为空）与**生产机的拉取源**——106 的 `/opt/AgentPipeline` 当时还 `origin` 指旧仓、HEAD 停在 `a67a97e`。后果是可量化的：10-13 之后的决策 422 与本轮 431 / 432 / 433 **一个字节都没上机**，票 07 文末那条「现场欠账」因此照旧挂在盘上。而这套系统的表面读数会把这件事藏住——`check` 绿、`deploy-106` 起 run、甚至将来某天 `state=success`，都与「106 上跑的是哪一版」无关。
+
+**裁决**：
+
+1. **唯一部署远端 = `lizezil/AgentPipeline`（public）**。106 的 origin 改指它：`git remote set-url origin https://github.com/lizezil/AgentPipeline.git`。`/opt/deploy.sh` 一行不改——它跑的是 `git pull --ff-only origin main`，按 **remote 名**取而不按 URL 写死，URL 换了它就换了源；public 也意味着拉取不需要 token。
+2. **五把 secrets 补进新仓**：`SSH_PRIVATE_KEY` / `SSH_KNOWN_HOSTS` / `DEPLOY_HOST`（=`106.12.12.6`）/ `DEPLOY_USER`（=`deploy`）/ `DEPLOY_CA_PEM`（根 CA，供外网 https 检查用）。取值全部来自本机既有材料，不需要新生成任何东西——`~/.ssh/106-ci.key` 与 106 上 `/home/deploy/.ssh/authorized_keys` 里那条 `ci-deploy-106` **指纹逐字节相同**（`SHA256:2PC5n9KHu3uijfCyabHYPZunVF37bhnYyhI/gaAbtl0`），服务器侧的门一直是开着的，缺的只是把钥匙交给现在这个仓。
+3. **换远端 = 一次部署动作**，要同时搬三样：仓库的 Actions secrets、生产机的拉取源、文档里那句「origin 是谁」。少一样都会得到同一形态的坏状态：**闸门会绿、部署永远起不来**（本轮就是这一种）。三样这一轮都对齐，skill 与 §12.18 里的旧仓地址一并改正。
+4. **「部署发生了」的判据加硬一层**：不能只看 `check` 绿，也不能只看 `deploy-106` 的 `state=success`，要读 **106 的 `git rev-parse --short HEAD` 与 main 尖端对照**。本轮正是这条读数才暴露出「机器停在 10-12」——run 的绿与代码的旧**可以同时成立**，这是决策 331 那条「推完必读结论」此前没覆盖的形状：它读的是闸门结论，而结论说不出「装上了没有」。
+5. **密钥出境需要人明确打字授权**：把私钥上传到 GitHub Actions secrets 这一步被权限层连拦两次（认「选项点选」不算授权），直到用户自己打出一句授权才放行，本条把这次授权记明。密钥内容不落仓库、不落文档、不落日志——`gh secret set` 走 stdin，全程只打印「已写入」。
+6. **边界**：不删旧仓（历史与那边的 secrets 原样留着，是回滚余地）；不把任何凭据的值复制进仓库文件（本条只写**名字**与主机/用户这类非机密标识）；不改 `deploy.yml` 的形态——它引用的 secret 名与步骤本来是对的，红的原因不是脚本写错，是仓换了。
+
+**代价（接受）**：代码零改动；运维侧一次 `remote set-url` + 五条 secret 写入 + 两处文档订正。双仓并存的那段历史（10-12 及以前）留在旧仓，本轮不做归档处置；`lizezil` 侧的 secrets 从此成为「删了就没有部署通路」的单点，与旧仓相比并未更安全，只是**更真**。
+
+**验证**：`check` run `38700849471` 四杆 success；`deploy-106` run `38705004613`（手动 `workflow_dispatch`，用于「调试部署脚本」那一类，非绕过闸门——`check` 已绿且 `d10f79d` 是 main 尖端）**七步全绿**：Set up SSH / SSH smoke test / Trigger rebuild / Poll rebuild status / External HTTPS check 都 success，另两条是 job 自身的 setup / complete。106 侧实测：`/opt/deploy.sh status` = `state=success`、`HEAD = d10f79d`、`main...origin/main` 无分叉、服务 `active`（启动时间 `Thu 2026-10-15 16:27:51 CST`）、`0.0.0.0:3389` 在听。外网三条（本机发起、不带任何凭据）：`https://106.12.12.6:3389/` → **403** 且正文命中「还没配对」；`/tasks` → **403 + `kind: pairing_required`**（反向检查过关：不是 200，决策 336 的门在岗）；旧明文口 3333 → `connection refused`。`git pull` 第一发撞在 `github.com:443` 超时上、第二发成功（日志里 `Updating a67a97e..d10f79d  Fast-forward`）——`git_pull_retry` 那 8 次重试吃得掉这种跨境抖动，本轮实测用掉 1 次。**一处口径差异如实记下**：skill 第④步写的是外网 https **401**，本轮实测是 **403**——`deploy.yml` 的外网检查接受 200/401/403 三码（决策 335 / 336 之后配对页换了响应码），skill 那句写于换码之前，判据以 `deploy.yml` 为准。
+
+**波及面**：skill `agentpipeline-deploy-106`（环境段那行的 `origin` 与排障段里的 `--repo`）；`docs/operations.md` §12.18 里「`deploy-106` 由 `workflow_run` 自动接力并成功」补一条订正，写明那次成功属旧仓；`docs/testing.md` §10 的本地窄跑补一句（改前端行数要带上 `make e2e`，见下）；`AGENTS.md` 与 `docs/README.md` 的决策计数 #1–433 → #1–434。
+
+**来源**：用户（2026-10-15 依次拍板「让它自动部署」「先修 GitHub 通路」「只收口到 lizezil」「授权把 106-ci.key 上传为 GitHub Actions secret」）；关联决策 330（闸门与部署的挂钩形状——本条补它默认存在的三处外部状态）、331（「推完必读结论」，本条把「结论」扩到「106 的 HEAD」）、335 / 336（3389 与配对闸门，外网验收的口径）、337–345（闸门转绿那一批，同一种「靠 run 号说话」的姿态）；证据：`gh api repos/lizezil/AgentPipeline/actions/secrets` 的空列表与旧仓的 403、106 上 `git remote -v` + `authorized_keys` 指纹 + `/tmp/deploy-rebuild.log` 首 12 行、两条 run 的逐步结论。
