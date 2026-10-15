@@ -429,6 +429,16 @@ impl ProductionLlm {
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        // 票 106-stability/06 · 决策 431：**跨块的 UTF-8 尾巴**。
+        //
+        // 这一层拿到的是网络分块，一个多字节字符（中文正文里到处是）可能被切在两块之间。
+        // 原先每块直接 `String::from_utf8_lossy` 转一次，切开的半个字符就落成 U+FFFD——
+        // 它污染的是**已经写进转录的字**：工具参数里的中文路径 / 中文正文被替换后，
+        // `submit_metadata` 拿到的是一个「看起来正常」的坏值，比报错更难查。
+        // 改法：字节先进 `pending`，只把**已完整**的 UTF-8 前缀转进 `buffer`，
+        // 尾巴留着和下一块拼接（见 [`take_complete_utf8`]）。流到头时残余（真正残缺的
+        // 尾部）按 lossy 收干——那是连接被掐断的现场，此时已经没有「下一块」可等。
+        let mut pending: Vec<u8> = Vec::new();
         let mut content = String::new();
         // 推理原文（决策 244）：和 `content` 分开攒，只用于展示留痕，不回灌。
         let mut reasoning = String::new();
@@ -478,10 +488,20 @@ impl ProductionLlm {
                             continue;
                         }
                         last_byte_at = Some(self.store.now());
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        pending.extend_from_slice(&bytes);
+                        if let Some(text) = take_complete_utf8(&mut pending) {
+                            buffer.push_str(&text);
+                        }
                     }
                     None => {
-                        // 流到头：残留尾行补一个换行，让它在下面走完
+                        // 流到头：先把手里那截尾巴收干——正常情况下它是空的（上一块已补齐），
+                        // 只有连接被掐在半字符中间时才有剩。剩了就没有「下一块」可等，
+                        // 按 lossy 换掉它并把补出来的内容走完最后一行（决策 431）。
+                        if !pending.is_empty() {
+                            buffer.push_str(&String::from_utf8_lossy(&pending));
+                            pending.clear();
+                        }
+                        // 残留尾行补一个换行，让它在下面走完
                         read_more = false;
                         if !buffer.is_empty() {
                             buffer.push('\n');
@@ -943,6 +963,56 @@ fn advance_idle_deadline(
     }
 }
 
+/// 取走缓冲里**已完整**的 UTF-8 前缀（票 106-stability/06 · 决策 431）。
+///
+/// 流式响应按网络分块到达，一个多字节字符可能被切在两块之间。本函数把已经齐了的部分
+/// 转成 `String` 交出去，**没齐的尾巴留在 `buf` 里等下一块**——于是切开的字符永远不会
+/// 被替换成 U+FFFD，参数与正文里的中文跨块也保持原样。
+///
+/// `Utf8Error` 的两种坏法要分开判：`error_len() == None` 是「尾部不足以判定」（即被切开的
+/// 半个字符，留着等下一块）；`error_len() == Some(n)` 是「这一段根本不是 UTF-8」（坏字节
+/// 留着也永远不会变好，再等下一块会把它们和后面的好内容一起卡死）——那种情况按 lossy
+/// 换掉坏字节继续走，坏的是上游的编码，不是我们的边界。
+///
+/// 一次调用取走**当前取得走的全部**（坏字节可能连着出现，故循环到取不动为止），
+/// 只在手上真的只剩「等下一块」的尾巴时返回 `None`。
+fn take_complete_utf8(buf: &mut Vec<u8>) -> Option<String> {
+    let mut out = String::new();
+    while !buf.is_empty() {
+        match std::str::from_utf8(buf) {
+            Ok(text) => {
+                out.push_str(text);
+                buf.clear();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                match e.error_len() {
+                    // 尾巴是「被切开的半个字符」：一个字都不许换掉，留着和下一块拼。
+                    None => {
+                        if valid == 0 {
+                            break;
+                        }
+                        let done: Vec<u8> = buf.drain(..valid).collect();
+                        out.push_str(
+                            &String::from_utf8(done)
+                                .expect("drain 掉的这一段由 from_utf8 判定为合法"),
+                        );
+                    }
+                    // 尾巴是「真坏掉的字节」：等下去永远不会变好，还会把后面的好内容一起卡死，
+                    // 故按 lossy 换掉这一小段继续走（坏的是上游的编码，不是我们的边界）。
+                    Some(bad) => {
+                        let take = valid + bad;
+                        out.push_str(&String::from_utf8_lossy(&buf[..take]));
+                        buf.drain(..take);
+                    }
+                }
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,6 +1062,71 @@ mod tests {
             advance_idle_deadline(None, None, start + Duration::from_secs(9), 42),
             None
         );
+    }
+
+    /// 票 106-stability/06 · 决策 431：**跨块切开的多字节字符不许变成 U+FFFD**。
+    ///
+    /// 「设」= `E8 AE BE`、「计」= `E8 AE A1`。把这两个字切成「前 4 字节 / 后 2 字节」两块
+    /// 喂进去：第一块只能交出成得了的「设」，`E8` 那半个字符留在缓冲里；第二块补齐后
+    /// 才交出「计」。旧写法（每块各 `from_utf8_lossy` 一次）在这里会把那半个 `E8`
+    /// 直接写成 `\u{FFFD}`，且**永远不会报错**——污染的是已经进转录的字。
+    #[test]
+    fn a_multibyte_char_split_across_chunks_survives_the_boundary() {
+        let body = "设计".as_bytes().to_vec();
+        let mut buf: Vec<u8> = Vec::new();
+
+        buf.extend_from_slice(&body[..4]);
+        let first = take_complete_utf8(&mut buf);
+        assert_eq!(
+            first.as_deref(),
+            Some("设"),
+            "第 4 字节处「计」只到了 E8 AE A1 的前半，交出去的只该有「设」"
+        );
+        assert_eq!(
+            buf.as_slice(),
+            &body[3..4],
+            "「计」的首字节 0xE8 是留下的尾巴"
+        );
+
+        buf.extend_from_slice(&body[4..]);
+        let second = take_complete_utf8(&mut buf);
+        assert_eq!(second.as_deref(), Some("计"), "补齐后就该交出剩下的字");
+        assert!(buf.is_empty(), "整段已取空");
+    }
+
+    /// 切点落在**第一个字符中间**时一块都交不出去——这正是旧写法立刻写下 U+FFFD 的那一刻。
+    #[test]
+    fn a_chunk_that_is_only_a_partial_char_yields_nothing() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.push("河".as_bytes()[0]);
+        assert_eq!(take_complete_utf8(&mut buf), None, "半个字符不许被换掉");
+        buf.extend_from_slice(&"河".as_bytes()[1..]);
+        assert_eq!(take_complete_utf8(&mut buf).as_deref(), Some("河"));
+    }
+
+    /// ASCII 流（SSE 帧头的常态）逐块直通，不引入任何缓冲延迟。
+    #[test]
+    fn ascii_bytes_pass_through_each_chunk_immediately() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"data: {\"a\":1}\n");
+        assert_eq!(
+            take_complete_utf8(&mut buf).as_deref(),
+            Some("data: {\"a\":1}\n")
+        );
+        assert!(buf.is_empty());
+    }
+
+    /// 真坏掉的字节（不是被切开的）按 lossy 换掉并**继续走**——留着它会让后面所有好内容
+    /// 一起卡在这个永远补不齐的尾巴上，那比重复一个替换符更糟。
+    #[test]
+    fn genuinely_invalid_bytes_are_replaced_and_the_stream_moves_on() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"ok\xff\xfe");
+        buf.extend_from_slice("好".as_bytes());
+        let out = take_complete_utf8(&mut buf).expect("坏字节要被收掉，不能空手回来");
+        assert!(out.starts_with("ok"), "{out:?}");
+        assert!(out.contains('好'), "坏字节之后的内容不许被卡住：{out:?}");
+        assert!(buf.is_empty(), "坏字节连同它污染的尾巴一起被取走");
     }
 
     #[test]

@@ -389,6 +389,7 @@ export type SseEventType =
   | 'command_finished'
   | 'conversation_delta'
   | 'tool_event'
+  | 'truncation_rescue'
   | 'stalled'
   | 'task_cancelled'
   | 'task_done'
@@ -510,6 +511,22 @@ export interface ToolEventEvent extends SseBase {
   ledger_id?: number | null;
   seq?: number | null;
 }
+export interface TruncationRescueEvent extends SseBase {
+  type: 'truncation_rescue';
+  stage: Stage;
+  node: Node;
+  run_id: number;
+  /** 被截断的那次调用的工具名（今天是 `submit_metadata`）。 */
+  tool: string;
+  /** 腰斩后实际到达的字节数。 */
+  raw_len: number;
+  /** schema 必填里没到的字段名（空 = 必填都到了）。 */
+  missing_fields: string[];
+  /** 本 run 内第几次救援（≥1）。 */
+  rescue_count: number;
+  /** 同一个 run 内 ≥2 次（票 06②：上游在挤牙膏，值得人知道）。 */
+  warn: boolean;
+}
 export interface StalledEvent extends SseBase {
   type: 'stalled';
   pending_hours: number;
@@ -536,6 +553,7 @@ export type SseEvent =
   | CommandFinishedEvent
   | ConversationDeltaEvent
   | ToolEventEvent
+  | TruncationRescueEvent
   | StalledEvent
   | TaskCancelledEvent
   | TaskDoneEvent

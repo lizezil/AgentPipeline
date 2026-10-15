@@ -6,6 +6,7 @@ import type {
   TaskListItem,
 } from '../api/types';
 import {
+  LIVE_RESCUE_WINDOW,
   LIVE_WINDOW_LIMIT,
   emptyBoardState,
   emptyTaskDetailState,
@@ -673,6 +674,89 @@ describe('直播增量的条数上限（决策 362①：环形缓冲丢最早）
     });
     expect(merged.liveTools).toHaveLength(1);
     expect(merged.liveDroppedRuns).toEqual({});
+  });
+});
+
+describe('截断救援的直播读数（票 06①：救援有损，任务面上要看得见）', () => {
+  const base = () => emptyTaskDetailState({ task: task(), cursors: [cursor()] });
+
+  const rescueEvent = (
+    runId: number,
+    count: number,
+    warn: boolean,
+  ): Extract<SseEvent, { type: 'truncation_rescue' }> => ({
+    type: 'truncation_rescue',
+    task_id: taskId,
+    branch: 'main',
+    stage: 'architect-design',
+    node: 'execute',
+    run_id: runId,
+    tool: 'submit_metadata',
+    raw_len: 31,
+    missing_fields: count === 1 ? ['readiness'] : [],
+    rescue_count: count,
+    warn,
+  });
+
+  it('落进 liveRescues：读数原样带上、seq 与增量共用一只计数器', () => {
+    let state = base();
+    state = reduceTaskDetail(state, rescueEvent(7, 1, false));
+    state = reduceTaskDetail(state, rescueEvent(7, 2, true));
+    expect(state.liveRescues).toHaveLength(2);
+    expect(state.liveRescues[0]).toMatchObject({
+      run_id: 7,
+      raw_len: 31,
+      missing_fields: ['readiness'],
+      rescue_count: 1,
+      warn: false,
+      seq: 0,
+    });
+    expect(state.liveRescues[1].seq).toBe(1);
+    expect(state.liveRescues[1].warn).toBe(true);
+  });
+
+  it('不进正文那两只桶：救援条数不吃增量窗口', () => {
+    const state = reduceTaskDetail(
+      reduceTaskDetail(base(), {
+        type: 'conversation_delta',
+        task_id: taskId,
+        branch: 'main',
+        run_id: 7,
+        agent_type: 'main',
+        role: 'assistant',
+        text: '正文',
+        prompt_tokens: 0,
+        completion_tokens: 1,
+      }),
+      rescueEvent(7, 1, false),
+    );
+    expect(state.liveDeltas).toHaveLength(1);
+    expect(state.liveTools).toHaveLength(0);
+    expect(state.liveRescues).toHaveLength(1);
+    expect(state.liveDroppedRuns).toEqual({});
+  });
+
+  it('上游持续挤牙膏时留尾部 50 条', () => {
+    let state = emptyTaskDetailState({
+      task: task(),
+      cursors: [cursor()],
+      liveRescues: Array.from({ length: LIVE_RESCUE_WINDOW }, (_, i) => ({
+        run_id: 7,
+        tool: 'submit_metadata',
+        raw_len: 31,
+        missing_fields: [],
+        rescue_count: i + 1,
+        warn: true,
+        seq: i,
+      })),
+      liveSeq: LIVE_RESCUE_WINDOW,
+    });
+    state = reduceTaskDetail(state, rescueEvent(7, LIVE_RESCUE_WINDOW + 1, true));
+    expect(state.liveRescues).toHaveLength(LIVE_RESCUE_WINDOW);
+    expect(state.liveRescues[0].rescue_count).toBe(2);
+    expect(state.liveRescues[state.liveRescues.length - 1].rescue_count).toBe(
+      LIVE_RESCUE_WINDOW + 1,
+    );
   });
 });
 

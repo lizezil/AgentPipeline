@@ -188,6 +188,23 @@ export interface LiveTool {
 }
 
 /**
+ * 一次截断救援的直播读数（票 06①）：`truncation_rescue` 事件的投影。
+ *
+ * 与 `LiveTool` 分桶：工具回执说「这次调用发生了什么」，这一条说「这次调用的内容缺了
+ * 哪几块」——后者要单独渲染成一行警示（结果正文里那句话藏在 12k 的折叠体里，等于没有）。
+ */
+export interface LiveRescue {
+  run_id: number;
+  tool: string;
+  raw_len: number;
+  missing_fields: string[];
+  rescue_count: number;
+  warn: boolean;
+  /** 到达序：与 {@link LiveDelta.seq} 同一只计数器。 */
+  seq: number;
+}
+
+/**
  * 直播增量的**条数上限**（决策 362①）：`liveDeltas` 与 `liveTools` **各**一只上限，
  * 方向是**环形缓冲丢最早**——直播只关心尾部，「到顶拒收」会让流停在半截。
  *
@@ -196,6 +213,9 @@ export interface LiveTool {
  * 前端追不上。**当前正在长的那一步不豁免**——一豁免，超长单步那次就绕过上限。
  */
 export const LIVE_WINDOW_LIMIT = 10_000;
+
+/** 截断救援行的窗口上限（票 06①）：救援不占正文窗口，但也不能无界（见归约处注释）。 */
+export const LIVE_RESCUE_WINDOW = 50;
 
 export interface TaskDetailState {
   task: Task | null;
@@ -208,6 +228,8 @@ export interface TaskDetailState {
   /** 进行中 run 的流式增量（按 run_id 分组）。 */
   liveDeltas: LiveDelta[];
   liveTools: LiveTool[];
+  /** 截断救援的直播读数（票 06①）；按 run 分组渲染在现场时间线里。 */
+  liveRescues: LiveRescue[];
   /**
    * 被上限丢弃过增量的 run（决策 362①④）：这些轮的折叠步序最前要摆一行非交互的
    * 「更早的增量已省略」。**只有标记，不含条数**——省略行不可交互、不承诺可数。
@@ -243,6 +265,7 @@ export function emptyTaskDetailState(partial: Partial<TaskDetailState> = {}): Ta
     conversations: [],
     liveDeltas: [],
     liveTools: [],
+    liveRescues: [],
     liveDroppedRuns: {},
     streamTokens: { prompt: 0, completion: 0 },
     liveSeq: 0,
@@ -481,6 +504,23 @@ export function reduceTaskDetail(state: TaskDetailState, event: SseEvent): TaskD
         liveDroppedRuns: markDropped(base.liveDroppedRuns, trimmed.dropped),
         liveSeq: state.liveSeq + 1,
       };
+    }
+
+    case 'truncation_rescue': {
+      // 救援行**不进 `LIVE_WINDOW_LIMIT` 那两只桶**：它一条都不占正文窗口，而一次事故
+      // 也就几条。仍给一个上限——上游持续挤牙膏时（票 06 的现场就是 20 分钟 5 条）
+      // 只留尾部 50 条，免得一个长节点把这一路撑成无界数组。
+      const rescue: LiveRescue = {
+        run_id: event.run_id,
+        tool: event.tool,
+        raw_len: event.raw_len,
+        missing_fields: event.missing_fields,
+        rescue_count: event.rescue_count,
+        warn: event.warn,
+        seq: state.liveSeq,
+      };
+      const kept = [...state.liveRescues, rescue].slice(-LIVE_RESCUE_WINDOW);
+      return { ...base, ...taskPatch, liveRescues: kept, liveSeq: state.liveSeq + 1 };
     }
 
     default:

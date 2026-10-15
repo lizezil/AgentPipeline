@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick, untrack } from 'svelte';
   import type { ConversationSummary, NodeCommand, NodeConversation } from '../../api/types';
-  import type { LiveDelta, LiveTool } from '../../realtime/reduce';
+  import type { LiveDelta, LiveRescue, LiveTool } from '../../realtime/reduce';
   import { formatClock, formatTokens } from '../../lib/format';
   import { formatDuration } from '../../lib/pipeline';
   import { thinkTicker } from '../../lib/talkTurns';
@@ -38,6 +38,8 @@
     commands: NodeCommand[];
     liveDeltas?: LiveDelta[];
     liveTools?: LiveTool[];
+    /** 截断救援的直播读数（票 06①）：与转录里落库的那份读数 dedupe 后各摆一行。 */
+    liveRescues?: LiveRescue[];
     /** 被条数上限丢弃过增量的 run（决策 362①）：这些轮最前摆一行非交互省略说明。 */
     liveDroppedRuns?: Record<number, true>;
     /** 完整 / 流式输出解析（完整 > 流式；preview 由归约兜底）。 */
@@ -55,6 +57,7 @@
     commands,
     liveDeltas = [],
     liveTools = [],
+    liveRescues = [],
     liveDroppedRuns = {},
     commandOutputFor,
     commandErrorFor,
@@ -73,6 +76,7 @@
       commands,
       liveDeltas,
       liveTools,
+      liveRescues,
       liveDroppedRuns,
       commandOutputFor,
       commandErrorFor,
@@ -341,6 +345,13 @@
               <pre class="rm-body mono draft">{step.text}</pre>
             {/if}
           </Fold>
+        {:else if step.notice}
+          {@const notice = step.notice}
+          <!-- 读数行（票 06①）：非交互、不可展开——它说的就是「内容缺了哪几块」这一件事。
+               琥珀是全站唯一告警色（`--pending`），升到 WARN 才用它；没升的就安静地摆着。 -->
+          <div class="notice" class:warn={notice.warn} data-notice={notice.kind} role="status">
+            {notice.text}
+          </div>
         {:else if step.tool}
           {@const tool = step.tool}
           <Fold
@@ -564,6 +575,20 @@
     border: 2px dashed var(--pane);
     color: var(--text-3);
     font-size: 12px;
+  }
+  /* 读数行（票 06①）：与 `.omitted` 同档（非交互、不可点），但它是**一件事发生了**的
+     读数，不是「少了东西」——故用实线描边，WARN 时换成全站唯一告警色。 */
+  .notice {
+    margin: 4px 0 6px;
+    padding: 3px 8px;
+    border: 2px solid var(--pane);
+    color: var(--text-2);
+    font-size: 12px;
+  }
+  .notice.warn {
+    border-color: var(--pending);
+    background: var(--pending-tint);
+    color: var(--pending);
   }
   /* ── 轮的收起行（决策 366）：字段一行排开，占满整行把 chevron 顶到尾部 ── */
   .turn-sum {

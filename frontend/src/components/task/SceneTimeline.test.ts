@@ -557,6 +557,103 @@ describe('上限截断的省略行（决策 362①）', () => {
   });
 });
 
+describe('截断救援的读数行（票 06①②）', () => {
+  const reading = (rawLen: number, missing: string[], count: number) =>
+    JSON.stringify({
+      success: true,
+      truncation_rescue: { raw_len: rawLen, missing_fields: missing, rescue_count: count },
+    });
+
+  /** 一轮「参数被腰斩 → 工具层按残值救回」的转录。 */
+  const rescuedTurn = (rawLen: number, missing: string[], count: number) =>
+    conv([
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'call-1',
+            type: 'function',
+            function: { name: 'submit_metadata', arguments: '{"blockers": [], "feedback": ' },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call-1',
+        name: 'submit_metadata',
+        content: reading(rawLen, missing, count),
+      },
+    ]);
+
+  /** 点开那一轮的折叠（决策 366：正文默认收在轮壳里）。 */
+  async function openTurn() {
+    const fold = document.querySelector('article.turn details.turnfold') as HTMLDetailsElement;
+    await fireEvent.click(fold.querySelector('summary') as HTMLElement);
+    return document.querySelector('[data-notice="truncation_rescue"]') as HTMLElement;
+  }
+
+  it('救援行摆出字节数与缺失字段，且是一行非交互的事实陈述', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run()],
+        conversationFor: () => rescuedTurn(31, ['readiness'], 1),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const row = await openTurn();
+    expect(row.textContent).toContain('31 字节');
+    expect(row.textContent).toContain('readiness');
+    expect(row.textContent).toContain('本轮第 1 次');
+    expect(row.classList.contains('warn')).toBe(false);
+    // 非交互：一行的事实陈述，不给按钮 / 链接（与省略行同口径）
+    expect(row.querySelector('button, a')).toBeNull();
+  });
+
+  it('本轮第二次起带 warn 档位；必填都在时也要说清「被截的不是必填」', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run()],
+        conversationFor: () => rescuedTurn(40, [], 2),
+        commands: [],
+        commandOutputFor: () => null,
+      },
+    });
+
+    const row = await openTurn();
+    expect(row.classList.contains('warn')).toBe(true);
+    expect(row.textContent).toContain('必填字段都在');
+    expect(row.textContent).toContain('本轮第 2 次');
+  });
+
+  it('直播那份只摆一行：落库读数与同一条事件对得上（dedupe）', async () => {
+    render(SceneTimeline, {
+      props: {
+        conversations: [run({ status: 'running' })],
+        conversationFor: () => rescuedTurn(31, ['readiness'], 1),
+        commands: [],
+        liveRescues: [
+          {
+            run_id: 1,
+            tool: 'submit_metadata',
+            raw_len: 31,
+            missing_fields: ['readiness'],
+            rescue_count: 1,
+            warn: false,
+            seq: 0,
+          },
+        ],
+        commandOutputFor: () => null,
+      },
+    });
+
+    await openTurn();
+    expect(document.querySelectorAll('[data-notice="truncation_rescue"]')).toHaveLength(1);
+  });
+});
+
 describe('现场时间线 · 渲染守卫（决策 361⑥ / 票 06）', () => {
   it('收起的系统消息正文不进 DOM；点开才到、可见', async () => {
     render(SceneTimeline, {

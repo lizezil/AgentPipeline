@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ChatMessage, ConversationSummary, NodeCommand, NodeConversation } from '../api/types';
-import type { LiveDelta, LiveTool } from '../realtime/reduce';
+import type { LiveDelta, LiveRescue, LiveTool } from '../realtime/reduce';
 import { buildTaskScene, sceneTurnMatches, type SceneTurn } from './taskScene';
 
 /**
@@ -426,6 +426,103 @@ describe('现场时间线 · 流式增量', () => {
     expect(turns[0].droppedLive).toBe(true);
     expect(turns[0].steps.map((s) => s.kind)).toEqual(['thinking', 'tool', 'thinking']);
     expect(turns[0].closing).toBe('结论如下');
+  });
+});
+
+describe('现场时间线 · 截断救援的读数行（票 06①②）', () => {
+  /** 后端挂进工具结果正文的那份读数（`model_invoke.rs::with_rescue_note`）。 */
+  const rescued = (rawLen: number, missing: string[], count: number) =>
+    JSON.stringify({
+      success: true,
+      truncation_rescue: { raw_len: rawLen, missing_fields: missing, rescue_count: count },
+    });
+
+  const submitTurn = (content: string): ChatMessage[] => [
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'call-1',
+          type: 'function',
+          function: { name: 'submit_metadata', arguments: '{"blockers": [], "feedback": ' },
+        },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'call-1', name: 'submit_metadata', content },
+  ];
+
+  const live = (
+    runId: number,
+    rawLen: number,
+    count: number,
+    warn: boolean,
+    seq: number,
+  ): LiveRescue => ({
+    run_id: runId,
+    tool: 'submit_metadata',
+    raw_len: rawLen,
+    missing_fields: count === 1 ? ['readiness'] : [],
+    rescue_count: count,
+    warn,
+    seq,
+  });
+
+  it('落库的救援读数摆在对应工具步之后，文案带字节数 / 缺失字段 / 第几次', () => {
+    const turns = build({
+      conversations: [run()],
+      conversationFor: () => conv(submitTurn(rescued(31, ['readiness'], 1))),
+    });
+    const steps = turns[0].steps;
+    expect(steps.map((s) => s.kind)).toEqual(['tool', 'notice']);
+    expect(steps[1].notice?.kind).toBe('truncation_rescue');
+    expect(steps[1].notice?.text).toContain('31 字节');
+    expect(steps[1].notice?.text).toContain('readiness');
+    expect(steps[1].notice?.text).toContain('本轮第 1 次');
+    // 单次救援不升档（票 06②：≥2 次才是「上游在挤牙膏」）
+    expect(steps[1].notice?.warn).toBe(false);
+  });
+
+  it('本轮第二次起亮 WARN；必填都在时也照样摆行（说清被截的不是必填）', () => {
+    const turns = build({
+      conversations: [run()],
+      conversationFor: () => conv(submitTurn(rescued(40, [], 2))),
+    });
+    const notice = turns[0].steps.find((s) => s.kind === 'notice');
+    expect(notice?.notice?.warn).toBe(true);
+    expect(notice?.notice?.text).toContain('必填字段都在');
+  });
+
+  it('直播那份摆行；落库后又到同一条事件时不摆两遍（dedupe 键 raw_len:rescue_count）', () => {
+    const turns = build({
+      conversations: [run({ status: 'running' })],
+      conversationFor: () => conv(submitTurn(rescued(31, ['readiness'], 1))),
+      liveRescues: [live(1, 31, 1, false, 0), live(1, 40, 2, true, 1)],
+    });
+    const notices = turns[0].steps.filter((s) => s.kind === 'notice');
+    expect(notices).toHaveLength(2);
+    expect(notices[0].notice?.text).toContain('本轮第 1 次');
+    expect(notices[1].notice?.text).toContain('本轮第 2 次');
+    expect(notices[1].notice?.warn).toBe(true);
+  });
+
+  it('没落地的轮（直播中）只靠事件也摆得出行', () => {
+    const turns = build({
+      conversations: [run({ status: 'running' })],
+      liveRescues: [live(1, 31, 1, false, 0)],
+    });
+    const notices = turns[0].steps.filter((s) => s.kind === 'notice');
+    expect(notices).toHaveLength(1);
+    expect(notices[0].notice?.text).toContain('参数被上游截断');
+  });
+
+  it('轮级过滤命中救援行文案即留下', () => {
+    const turns = build({
+      conversations: [run()],
+      conversationFor: () => conv(submitTurn(rescued(31, ['readiness'], 1))),
+    });
+    expect(sceneTurnMatches(turns[0], 'readiness')).toBe(true);
+    expect(sceneTurnMatches(turns[0], '不可能命中的串')).toBe(false);
   });
 });
 

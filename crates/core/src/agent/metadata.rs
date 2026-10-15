@@ -345,17 +345,21 @@ pub fn has_broken_submit_metadata_arguments(messages: &[super::client::Message])
 /// 空串不算坏：部分工具调用本来就不带参数，`""` 与「还没收到」在这条判据上分不开，
 /// 而把后者也算坏会让每一次无参调用都落成非 ok。
 pub fn any_tool_arguments_broken(calls: &[super::client::ToolCall]) -> bool {
-    calls.iter().any(|tc| {
-        !tc.arguments.trim().is_empty()
-            && serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err()
-    })
+    calls.iter().any(|tc| any_argument_broken(&tc.arguments))
 }
 
-/// 「参数不是合法 JSON」时的收场说明（票 01③）；参数完整时给 `None`。
+/// 「参数不是合法 JSON」时的收场说明（票 01③；票 06① 把缺失字段一并带上）；参数完整时给 `None`。
 ///
 /// **带上上游的收尾原因**：`length`（OpenAI）/ `max_tokens`（Anthropic）是「上游按上限
 /// 切断了输出」的直接证据，排查时它比任何猜测都硬。
-pub fn broken_arguments_note(response: &super::client::AgentResponse) -> Option<String> {
+///
+/// `submit_schema` 是这一轮广告给模型的 `submit_metadata` 参数 schema（同一次请求的
+/// `tools` 里那份，与阶段结构体同源，决策 38）。有它才能报出**缺的是哪些必填字段**——
+/// 票 01③ 之前这条 note 只说「被截断」，读到的人仍然要去猜被截掉的到底是哪一个字段。
+pub fn broken_arguments_note(
+    response: &super::client::AgentResponse,
+    submit_schema: Option<&serde_json::Value>,
+) -> Option<String> {
     if !any_tool_arguments_broken(&response.tool_calls) {
         return None;
     }
@@ -364,7 +368,67 @@ pub fn broken_arguments_note(response: &super::client::AgentResponse) -> Option<
     if let Some(reason) = response.finish_reason.as_deref() {
         note.push_str(&format!("；上游收尾原因：{reason}"));
     }
+    if let (Some(schema), Some(raw)) = (
+        submit_schema,
+        response
+            .tool_calls
+            .iter()
+            .find(|tc| tc.name == "submit_metadata" && any_argument_broken(&tc.arguments))
+            .map(|tc| tc.arguments.as_str()),
+    ) {
+        let missing = missing_required_fields(schema, raw);
+        note.push_str(&format!(
+            "；缺失的必填字段：{}",
+            if missing.is_empty() {
+                "（无：被截的是可选字段或正文尾部）".to_string()
+            } else {
+                missing.join("、")
+            }
+        ));
+    }
     Some(note)
+}
+
+/// 单个参数串是否**非空且不是合法 JSON**——[`any_tool_arguments_broken`] 的逐条判据，
+/// 也是票 06「这次调用是不是被腰斩的」的那把尺（编排在数转录里的救援次数时用它）。
+pub fn any_argument_broken(raw: &str) -> bool {
+    !raw.trim().is_empty() && serde_json::from_str::<serde_json::Value>(raw).is_err()
+}
+
+/// 这份参数里**到了哪些顶层字段**（票 06①：把「被截掉的是哪些」变成一个读数）。
+///
+/// 完整 JSON 直接 parse；坏的先交给 [`rescue_truncated_json`] 取残值——残值的键集合就是
+/// 上游切断之前模型**已经写完**的那几个字段。两条路都不通时返回 `None`：那是「一个字段
+/// 都没收到」，不许猜成「都收到了」（猜错的后果是把全丢报成没丢）。
+pub fn arrived_top_level_fields(raw: &str) -> Option<Vec<String>> {
+    let value = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => v,
+        Err(_) => rescue_truncated_json(raw)?,
+    };
+    value.as_object().map(|map| map.keys().cloned().collect())
+}
+
+/// schema 的必填字段里，这份参数还缺哪些（票 06①）。
+///
+/// **为什么在编排侧算而不是在工具执行体里算**：必填集由 `schemars` 从阶段结构体生成，
+/// 与 [`crate::agent::client::submit_metadata_tool`] 同源；工具执行体只拿到一串参数文本，
+/// 它不知道该节点要哪些字段——那份知识住在编排侧的 `AgentNodeKind`
+/// （「那个 `T` 只在它那里知道」，见 `tools.rs::submit_metadata` 的注释）。
+pub fn missing_required_fields(schema: &serde_json::Value, raw: &str) -> Vec<String> {
+    let required: Vec<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let arrived = arrived_top_level_fields(raw).unwrap_or_default();
+    required
+        .into_iter()
+        .filter(|key| !arrived.contains(key))
+        .collect()
 }
 
 /// 提取 ```json ... ``` 或 ``` ... ``` 围栏中的第一个 JSON 对象。
@@ -642,6 +706,97 @@ mod tests {
         assert!(
             p.contains("本轮的最终动作必须是调用 submit_metadata"),
             "{p}"
+        );
+    }
+
+    // ── 票 06①：救援读数的三件套（到达字段 / 缺失必填 / 收场说明）──────────────
+
+    /// architect.execute 的真实 schema（决策 38：与广告给模型的那一份同源）。
+    fn arch_schema() -> serde_json::Value {
+        crate::agent::client::submit_metadata_tool::<ArchitectExecuteMetadata>("测试用").parameters
+    }
+
+    #[test]
+    fn arrived_fields_reads_a_rescued_fragment_not_the_clean_json() {
+        // 完整参数：直接 parse
+        let whole = r#"{"readiness": true, "blockers": []}"#;
+        let mut arrived = arrived_top_level_fields(whole).unwrap_or_default();
+        arrived.sort();
+        assert_eq!(
+            arrived,
+            vec!["blockers".to_string(), "readiness".to_string()]
+        );
+        // 腰斩残片（conv 99）：`feedback` 的值没写完，但**键到了**——报「到了哪些」时算它到，
+        // 判缺失只看必填集合，别把可选字段的残值说成丢了整个字段。
+        let broken = r#"{"blockers": [], "feedback": "#;
+        let arrived = arrived_top_level_fields(broken).unwrap_or_default();
+        assert!(arrived.contains(&"blockers".to_string()), "{arrived:?}");
+        // 一个字段都没收到 → `None`，不许猜成「都收到了」
+        assert!(
+            arrived_top_level_fields("{").is_none(),
+            "救不出任何键时必须承认没读数"
+        );
+    }
+
+    #[test]
+    fn missing_required_fields_names_what_the_cut_took_away() {
+        let schema = arch_schema();
+        // 必填只有 `readiness`（conv 88 实证）：被它截走就报它
+        assert_eq!(
+            missing_required_fields(&schema, r#"{"blockers": [], "feedback": "#),
+            vec!["readiness".to_string()]
+        );
+        // 必填都到了：空清单——被截的是可选字段或正文尾部，这跟「丢了必填」是两件事
+        assert!(
+            missing_required_fields(&schema, r#"{"readiness": true, "test_scenarios_path": "#)
+                .is_empty(),
+            "必填齐全就不该报缺失"
+        );
+        // 全丢：必填一个不剩
+        assert_eq!(
+            missing_required_fields(&schema, "{"),
+            vec!["readiness".to_string()]
+        );
+    }
+
+    #[test]
+    fn broken_arguments_note_carries_the_missing_required_fields() {
+        let schema = arch_schema();
+        let mut response =
+            response_with_tool("submit_metadata", r#"{"blockers": [], "feedback": "#);
+        response.finish_reason = Some("length".into());
+        let note =
+            broken_arguments_note(&response, Some(&schema)).expect("参数被腰斩时要有收场说明");
+        assert!(note.contains("工具参数不是合法 JSON"), "{note}");
+        assert!(
+            note.contains("length"),
+            "上游收尾原因是硬证据，要带上：{note}"
+        );
+        assert!(note.contains("readiness"), "缺哪块要报得出名字：{note}");
+
+        // 没 schema 就只说截断，不编造字段清单
+        let bare = broken_arguments_note(&response, None).expect("无 schema 也要有说明");
+        assert!(!bare.contains("缺失的必填字段"), "{bare}");
+
+        // 必填齐全的救援：说明仍然给出（截断这件事成立），但字段栏要说「无」
+        let ok = response_with_tool(
+            "submit_metadata",
+            r#"{"readiness": true, "test_scenarios_path": "#,
+        );
+        let note = broken_arguments_note(&ok, Some(&schema)).expect("残片仍是残片");
+        assert!(
+            note.contains("（无：被截的是可选字段或正文尾部）"),
+            "{note}"
+        );
+
+        // 参数完整 → 没有这条说明
+        assert!(
+            broken_arguments_note(
+                &response_with_tool("submit_metadata", r#"{"readiness": true}"#),
+                Some(&schema)
+            )
+            .is_none(),
+            "干净调用不许留下截断说明"
         );
     }
 

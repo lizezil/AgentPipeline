@@ -81,6 +81,35 @@ pub(crate) fn emit_tool_event(
     });
 }
 
+/// 同一 run 内第几次救援起升 WARN（票 06②：连续截断 = 上游在挤牙膏，值得人知道）。
+///
+/// 阈值住在这个出口、与事件形状同处：调用点各猜一个数，就会出现「现场里两次升红、
+/// 别处三次」这种没人能对照的读数。
+pub(crate) const TRUNCATION_RESCUE_WARN_AFTER: usize = 2;
+
+/// 一次截断救援的**唯一出口**（票 06①）：读数在这一个地方定形——第几次、缺哪些字段、
+/// 要不要升 WARN。调用点（`model_invoke` 的工具往返）只负责把现场递进来。
+pub(crate) fn emit_truncation_rescue(
+    sse: &dyn SseSink,
+    task: &Task,
+    cursor: &NodeCursor,
+    run_id: i64,
+    reading: &super::model_invoke::RescueReading,
+) {
+    sse.emit(SseEvent::TruncationRescue {
+        task_id: task.id.clone(),
+        branch: cursor.branch.clone(),
+        run_id,
+        stage: cursor.stage,
+        node: cursor.node,
+        tool: reading.tool.clone(),
+        raw_len: reading.raw_len,
+        missing_fields: reading.missing_fields.clone(),
+        rescue_count: reading.rescue_count,
+        warn: reading.rescue_count >= TRUNCATION_RESCUE_WARN_AFTER,
+    });
+}
+
 /// `NodeStarted` 的唯一出口（形状只此一处；留守核的 begin 与编排片的带链开立都走它）。
 pub(crate) fn emit_node_started(
     sse: &dyn SseSink,

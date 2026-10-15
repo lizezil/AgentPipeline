@@ -282,16 +282,21 @@ class TaskDetailStore {
     const hasLanded =
       this.state.liveDeltas.some((d) => isLanded(d.run_id)) ||
       this.state.liveTools.some((t) => isLanded(t.run_id)) ||
+      this.state.liveRescues.some((r) => isLanded(r.run_id)) ||
       Object.keys(this.state.liveDroppedRuns).some((key) => isLanded(Number(key)));
     if (!hasLanded) return;
     const keptDeltas = this.state.liveDeltas.filter((d) => !isLanded(d.run_id));
     const keptTools = this.state.liveTools.filter((t) => !isLanded(t.run_id));
+    // 救援行也一样收走（票 06①）：它落库的那一份在工具结果的读数里，正文到手后由
+    // `taskScene` 从转录摆出——直播那一份不留在场上，否则同一件事现场摆两行。
+    const keptRescues = this.state.liveRescues.filter((r) => !isLanded(r.run_id));
     const droppedRuns = { ...this.state.liveDroppedRuns };
     for (const key of Object.keys(landed)) delete droppedRuns[Number(key)];
     this.state = {
       ...this.state,
       liveDeltas: keptDeltas,
       liveTools: keptTools,
+      liveRescues: keptRescues,
       liveDroppedRuns: droppedRuns,
     };
   }
@@ -302,7 +307,9 @@ class TaskDetailStore {
     // 落地即清（决策 362②）：正文已到手的 run 又来了一条增量（落地那一刻前后到达序上的
     // 竞态），当场收走——否则它会一直挂在时间线上直到下一次正文装载。
     if (
-      (event.type === 'conversation_delta' || event.type === 'tool_event') &&
+      (event.type === 'conversation_delta' ||
+        event.type === 'tool_event' ||
+        event.type === 'truncation_rescue') &&
       this.conversationsFull[event.run_id] !== undefined
     ) {
       this.clearLandedLive();

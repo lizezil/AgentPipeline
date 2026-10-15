@@ -56,16 +56,16 @@ pub const LLM_TRANSPORT_RESEND_MAX: usize = 2;
 const USAGE_PROJECTION_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 use super::events::{
-    emit_node_started, emit_tool_event, finish_run_with_sse, OUTPUT_CODE_CHANGES,
-    OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT, OUTPUT_TEST_REPORT,
-    OUTPUT_TEST_SCENARIOS, PIPELINE_AGENT_TYPE,
+    emit_node_started, emit_tool_event, emit_truncation_rescue, finish_run_with_sse,
+    OUTPUT_CODE_CHANGES, OUTPUT_DESIGN_DOC, OUTPUT_DEV_DOC, OUTPUT_REVIEW_REPORT,
+    OUTPUT_TEST_REPORT, OUTPUT_TEST_SCENARIOS, PIPELINE_AGENT_TYPE,
 };
 // 留守核与本片的接线契约（取消信号 / 路由结论 / 项目行收口）——不是事件形状，主人仍是
 // executor（决策 249 的接线；352 只搬事件面）。
 use super::executor::{project_or_err, CancelOrigin, CancelSignal, NodeOutput};
 use super::model_request::{
-    effective_declared_tools, workdirs_line, AttemptCtx, BudgetCheck, OverflowFacts, Prepared,
-    RequestPlan,
+    effective_declared_tools, submit_metadata_tool_for, workdirs_line, AttemptCtx, BudgetCheck,
+    OverflowFacts, Prepared, RequestPlan,
 };
 use super::run_ledger::{since_ms, RunLedger};
 use crate::pipeline::subagent::RunTokens;
@@ -1311,6 +1311,17 @@ impl ModelInvoke {
                         }
                         // 刹车判据跟着这一条走：本批里同名的后续调用不再执行。
                         braked = batch_abort;
+                        // 票 06①：参数被上游腰斩、工具层按残值救回时，把「缺了哪几块」以
+                        // **结构化读数**补进这一次调用的结果正文，并发一条 `truncation_rescue`
+                        // 事件。救援是**有损**的，而此前这件事只有一行 `tracing::warn`——任务
+                        // 面上零可见，流程照走。
+                        let content = match truncation_rescue_reading(kind, call, &trace.messages) {
+                            Some(reading) => {
+                                emit_truncation_rescue(&*self.sse, task, cursor, run_id, &reading);
+                                with_rescue_note(content, &reading)
+                            }
+                            None => content,
+                        };
                         // 结果详情（决策 301）在 `content` 被移进转录**之前**递出去——
                         // 事件是它的第一读者，转录是第二份。
                         emit_tool_event(
@@ -1969,6 +1980,90 @@ impl ModelInvoke {
             )),
             trace.tokens,
         ))
+    }
+}
+
+/// 一次截断救援的**读数**（票 06①）。
+///
+/// 收成一份结构而不是四个散装参数：发射事件、挂进结果正文、写日志三处都要同一组数，
+/// 参数摊开时 `emit_truncation_rescue` 一路吃到 8 个入参（clippy `too_many_arguments`），
+/// 那是「一份读数的四个字段被当成四件事」的形状。字段含义见 [`with_rescue_note`]。
+pub(crate) struct RescueReading {
+    /// 被截断的那次调用的工具名（今天是 `submit_metadata`）。
+    pub tool: String,
+    /// 腰斩后实际到达的字节数。
+    pub raw_len: usize,
+    /// schema 必填里没到的字段名（空 = 必填都到了）。
+    pub missing_fields: Vec<String>,
+    /// 本 run 内第几次救援（≥1）。
+    pub rescue_count: usize,
+}
+
+/// 这一次调用是不是**一次有损的截断救援**（票 06①）。
+///
+/// 是 → 一份 [`RescueReading`]（工具名 / 到达字节数 / 缺哪些必填 / 本 run 第几次）；否 → `None`。
+///
+/// **为什么在编排侧算缺哪些字段**：必填集由 `schemars` 从阶段结构体现生成
+/// （[`submit_metadata_tool_for`]，与校验同源，决策 38），而工具执行体只拿到一串参数文本、
+/// 不知道该节点要哪些字段——那份知识住在这里（`tools.rs::submit_metadata` 的注释同说这件事）。
+///
+/// **救援次数数的是转录行**，不是进程内的计数器：一条 run 的转录就是「这一轮模型说过几次
+/// `submit_metadata`」的真相源，而 `let mut n = 0` 会随 attempt 归零——按 attempt 归零正是
+/// 本票要消灭的那种隐身。同一个数也是前端落库那一份的编号（见 `with_rescue_note`），
+/// 两边同键才 dedupe 得掉。
+fn truncation_rescue_reading(
+    kind: AgentNodeKind,
+    call: &crate::agent::client::ToolCall,
+    trace: &[Message],
+) -> Option<RescueReading> {
+    if call.name != "submit_metadata"
+        || !crate::agent::metadata::any_argument_broken(&call.arguments)
+    {
+        return None;
+    }
+    let schema = submit_metadata_tool_for(kind).parameters;
+    let missing = crate::agent::metadata::missing_required_fields(&schema, &call.arguments);
+    let count = trace
+        .iter()
+        .filter(|m| matches!(m.role, crate::agent::client::Role::Assistant))
+        .flat_map(|m| m.tool_calls.iter())
+        .filter(|tc| {
+            tc.name == "submit_metadata"
+                && crate::agent::metadata::any_argument_broken(&tc.arguments)
+        })
+        .count();
+    Some(RescueReading {
+        tool: call.name.clone(),
+        raw_len: call.arguments.len(),
+        missing_fields: missing,
+        rescue_count: count.max(1),
+    })
+}
+
+/// 把救援读数挂进工具结果正文。
+///
+/// **挂的是结构化读数，不是一句话**：这一份同时是模型读的、落进转录的、界面渲染的——
+/// 措辞交给渲染侧（`frontend/src/lib/taskScene.ts` 的救援行），后端不生产页面文案。
+/// 键名固定 `truncation_rescue`，值 `{raw_len, missing_fields, rescue_count}`：
+/// 现场页签据此**与直播事件对同一条**（dedupe 键 = `raw_len:rescue_count`），刷新后还看得见
+/// 这件事就靠这一份落库的读数。
+///
+/// **同时修正一处旧误导**：救援成功时工具层回的是 `{"success":true}`——字段明明丢了，
+/// 模型却被告知一切正常。补上读数不改变重试语义（决策 367 的「按截断处置」一字不动），
+/// 只是把那句话改回真的。
+fn with_rescue_note(content: String, reading: &RescueReading) -> String {
+    let note = serde_json::json!({
+        "raw_len": reading.raw_len,
+        "missing_fields": reading.missing_fields,
+        "rescue_count": reading.rescue_count,
+    });
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(mut value) if value.is_object() => {
+            value["truncation_rescue"] = note;
+            value.to_string()
+        }
+        // 结果正文本来不是 JSON：附一行读数。宁可难看，不可无效——这一份是渲染面要读的。
+        _ => format!("{content}\n{note}"),
     }
 }
 

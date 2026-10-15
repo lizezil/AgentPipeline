@@ -3506,3 +3506,40 @@ config.rs}`、`tests/e2e/tests/integration/stage_boundary.rs`、`docs/testing.md
 **验证**：迁移层 `foreman_proposal_reading_migration.rs`（老形态行 `Store::open` 后 `reading` 为 NULL、其余列原样；样板第三份副本顺手收进 `testkit::migrations::migrate_up_to`——rule of three）；存储层 `the_reading_round_trips_through_the_store_and_silence_stays_none`；闸点 `the_reading_is_lifted_out_of_the_args_and_the_args_stay_clean` / `a_call_without_a_reading_lands_a_card_with_none`（摘取、回净、缺席三态）；广告面 `the_reading_parameter_is_advertised_to_mutating_tools_only`（逐工具与 `mutates_something` 相等）；提示面 `the_discipline_tells_the_model_to_state_its_reading_before_acting`；L3 `proposal_wire_carries_the_reading_and_its_absence`。core 1430 全绿、app 353 全绿、前端 1217 全绿、§12.3 新行过 behavior-map、clippy / fmt / svelte-check 干净。评审两轴：Standards 无硬违规（采纳两处——迁移样板收拢、提示面门控对齐）；Spec 无缺失。手工面（409 / 410 / 411 三轮重演）留在票面，随部署兑现。
 
 **来源**：票 `foreman-work-record/04` 原文（实证出自 2026-10-08 班次 `01M4CDY9EC9M9FSSE236GJXYZC`，同 422⑤）；关联决策 422⑤（(a)+(b) 方向）、207 / 216（人按纪律，本条不动）、265（`ask` 结构化选项问话）、415（读不到不编数）、428（迁移姿态先例）、427 / 429（CLI 通道的边界）。
+
+### 决策 431 · 流式分块的 UTF-8 边界：只交出完整字符，半个字留在缓冲里等下一块（票 `106-stability` 06③）
+
+**起因**：106 的截断族里有一处比截断更安静。生产适配器拿的是网络分块，原先每块直接 `String::from_utf8_lossy` 转一次——一个中文字（3 字节）被切在两块之间时，前半就地落成 U+FFFD。**不报错、不中断、不重试**，替换符直接写进转录与工具参数：`write_file` 的中文路径、`submit_metadata` 的中文正文都被静默改过一个字。它比截断难查得多，因为那一轮面上是成功的，而坏掉的东西已经落库（决策 278 的续接读的就是这一份）。
+
+**裁决**：
+
+1. **字节先进缓冲，只交出已完整的前缀**：`providers/mod.rs::take_complete_utf8` 把当前取得走的全部转成 `String` 交出去，没齐的尾巴留在 `pending` 里和下一块拼。一次调用循环到取不动为止，只在手上真的只剩「等下一块」的尾巴时返回 `None`。
+2. **`Utf8Error` 的两种坏法分开判**（这条是本决策的实体）：`error_len() == None` 是「尾部不足以判定」，即被切开的半个字符——一个字都不许换掉；`error_len() == Some(n)` 是「这一段根本不是 UTF-8」，留着等下一块永远不会变好，还会把后面的好内容一起卡死，故按 lossy 换掉那一小段继续走。**坏的是上游的编码，不是我们的边界**——两种情况混成一支处理，前者会写错字、后者会卡死流。
+3. **流到头的尾巴按 lossy 收干**：正常情况下缓冲在最后一块就空了，只有连接被掐在半字符中间才有剩；那时已经没有「下一块」可等，收干后把补出来的最后一行走完。
+4. **边界**：不动截断处置那套语义（决策 367 的按截断分流一字未改），不引校验和、不改上游、不在这一层判断「截没截」——这一层只保证**分块边界不制造错字**，截断是另一件事（决策 432）。
+
+**代价（接受）**：一层字节缓冲（每块多一次 `drain`）与一个「尾巴等不到下一块」的收口分支；坏字节路径仍走 lossy，故真·非 UTF 上游的替换符照旧存在——那是上游的错，看得见也比静默卡死好。
+
+**验证**：`providers/mod.rs` 单测四条——跨块切开的一个字（`a_multibyte_char_split_across_chunks_survives_the_boundary`）、整块只有半个字符时**空手回来**（`a_chunk_that_is_only_a_partial_char_yields_nothing`）、纯 ASCII 即刻过（`ascii_bytes_pass_through_each_chunk_immediately`）、真坏字节不卡死后续内容（`genuinely_invalid_bytes_are_replaced_and_the_stream_moves_on`）；L2 从**真 HTTP 流**打进来（`production_llm.rs::a_multibyte_char_split_across_tcp_chunks_reaches_the_tool_intact`，配 `spawn_stream_split_in_two`：两块之间 `flush` 并睡 120ms，否则同批写出会被合成一个 chunk 而白切），钉的是收口后那份参数原文——无 U+FFFD、仍是合法 JSON、「设计」二字原样到达。`MockRoute::sse` 造不出这个形状（它一次写完整个 body），故这条必须走 raw server。
+
+**来源**：票 `106-stability/06` 第③条；关联决策 244（reasoning 声道走同一条流，同理受保护）、278（续接读落库的字，错字一旦落下就永久留在转录里）、367（截断处置，本条不动它）、432（同一张票的另一半）。
+
+### 决策 432 · 截断救援显性化：三处落点、一份结构化读数、第二次起升档（票 `106-stability` 06①②）
+
+**起因**：参数被上游腰斩、工具层按残值救回之后，流程照走——此前唯一的痕迹是一行 `tracing::warn`，进程没了就什么都查不到，而任务面上零可见。更糟的是救援成功时工具回给模型的是 `{"success":true}`：**字段明明丢了，模型却被告知一切正常**，于是它换个字段名再发一次，2026-09-30 那条链上 `validate_output` 连挂三次就是这么来的（票 `silent-degradation/01` 缺陷 1；诊断与回灌文案已由决策 367 改对，本条补的是**可见性**那一半）。
+
+**裁决**：
+
+1. **读数在编排侧算，不在工具执行体算**：必填集由 schemars 从阶段结构体生成、与广告给模型的那一份同源（决策 38），而工具只拿到一串参数文本，它不知道该节点要哪些字段——那份知识住在 `AgentNodeKind` 一侧（`tools.rs::submit_metadata` 的旧注释早写明「那个 `T` 只在它那里知道」）。落点：`model_invoke.rs::truncation_rescue_reading` + `metadata.rs::{arrived_top_level_fields, missing_required_fields}`。
+2. **三处落点，各答一个别的问题**：**事件** `truncation_rescue`（`sse.rs` 新变体，形状唯一出口 `pipeline/events.rs::emit_truncation_rescue`，决策 249/352）答「正在跑的时候告不告得出来」；**台账** note（`broken_arguments_note` 现在按 schema 报出缺哪几块，收场仍记 `error` 不记 `ok`，决策 01③ 那条）答「事后按 run 查得到吗」——schema 必须在 `recording.rs` 里**请求被搬走之前**抄一份；**转录**（把读数挂进那一次调用的结果正文）答「刷新后现场页签还看得见吗」。顺带把那句 `{"success":true}` 改回真的。
+3. **后端只出结构化读数，不生产页面文案**：`{raw_len, missing_fields, rescue_count}` 三份共用——同一份既给模型读、又落进转录、又被界面渲染，措辞住渲染侧（`taskScene.ts::rescueNoticeStep`）。两边各写一句话必然分叉（票 06 原样要求「写进事件」而非「写进一句人话」）。
+4. **WARN 档位的判据是「同一 run 内第几次」**（票 06②）：`rescue_count >= 2`（常量 `TRUNCATION_RESCUE_WARN_AFTER` 后端前端各一份同值，注释互指）。计数**按 run 现推**——从 `trace.messages` 的 assistant `tool_calls` 数出这一轮被腰斩的 `submit_metadata` 调用（`.max(1)` 兜住「当前这条还没进转录」那一刻）。跨 attempt **不算**：每次重试是干净对话（决策 33），把两次重试各一次截断升成警报警的是网关抖动。一次截断可能是抖动，同一轮连着两次才是「上游在挤牙膏」。
+5. **直播与落库对同一条用 `raw_len:rescue_count` 作键**：同一件事的两个来源带着同一对数，而这一对在一次 run 内唯一。不 dedupe 的后果是现场摆两行、且其中一行刷新后消失——比少一行更难解释。落地即清（决策 362②）把 `liveRescues` 一并纳入核对，晚到的救援事件同样当场收走。
+6. **不新增 `AttentionKind` 类别**：attention 是任务级「需要人来处理」的清单，而一次**流程照走**的有损救援够不上那一档——它是在现场看得见的事，不是一条待办。升档靠 `warn` 档位（前端用全站唯一告警琥珀 `--pending`），不靠多一个类别。
+7. **边界**（票 06 原话，一字未越）：不重试截断的工具调用、不引校验和、不动上游；决策 367 的「按截断处置」（标记、诊断、回灌文案）一字未改，本条只在它旁边**加读数**。
+
+**代价（接受）**：一条新事件类型 + 前端一路（归约 / 折步 / 渲染 / 落地即清）；救援那一次的工具结果正文变长几十字节并进模型上下文——它本来就该知道自己缺了什么，那句 `success: true` 才是更贵噪声；转录里多一条 `notice` 步（不可交互，与省略行同口径）。
+
+**验证**：core 单测三条（`arrived_fields_reads_a_rescued_fragment_not_the_clean_json` / `missing_required_fields_names_what_the_cut_took_away` / `broken_arguments_note_carries_the_missing_required_fields`，schema 用 `submit_metadata_tool::<ArchitectExecuteMetadata>` 现取，不与生产分叉）；L2 两条（`executor.rs::a_lossy_rescue_is_visible_in_events_the_ledger_and_the_transcript` 三处落点逐处断言、`the_second_rescue_in_a_run_raises_the_warn_grade` 钉事件序列恰为 `(1,false),(2,true)`）；前端 reduce 三条、taskScene 五条（含 dedupe 与 WARN 档）、SceneTimeline 三条（渲染行与档位、非交互）、store 落地即清两条。core 与前端 1229 全绿，`cargo check --workspace --all-targets` 干净。
+
+**来源**：票 `106-stability/06` ①②（实证：conv 88 / 99 的实测残片、2026-09-30 连挂三次那条链）；关联决策 367（按截断处置，本条的相邻面）、38（schema 同源）、249 / 352（事件形状唯一出口）、301（工具详情上限）、362②（落地即清）、410（合成回执同形落行的先例）、431（同票另一半）。

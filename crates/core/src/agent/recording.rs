@@ -111,6 +111,14 @@ impl LlmClient for RecordingLlm {
                 request_id,
                 settled: false,
             };
+            // 票 06①：`submit_metadata` 的参数 schema 要在请求被搬走**之前**抄一份——
+            // 台账的 note 要报出「必填里缺了哪几块」，而那一份是这次请求自己带的（决策 38
+            // 的同源：广告给模型的 schema 与校验用的是同一份结构体）。
+            let submit_schema = request
+                .tools
+                .iter()
+                .find(|t| t.name == "submit_metadata")
+                .map(|t| t.parameters.clone());
             let outcome = inner.complete(request).await;
             // 票 01③：**参数完整性不达标时收场不许记 `ok`**。`complete` 仍然成功返回——
             // 被腰斩的参数串还要交给 `rescue_truncated_json` 去救（那是既有能力，不动），
@@ -118,7 +126,10 @@ impl LlmClient for RecordingLlm {
             // 永远看不出来——本次事故里 33 轮请求全是 `ok`，截断这件事因此一直隐身。
             let (status, usage, note) = match &outcome {
                 Ok(response) => {
-                    let broken = crate::agent::metadata::broken_arguments_note(response);
+                    let broken = crate::agent::metadata::broken_arguments_note(
+                        response,
+                        submit_schema.as_ref(),
+                    );
                     (
                         if broken.is_some() {
                             ModelRequestStatus::Error

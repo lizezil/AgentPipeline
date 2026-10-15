@@ -5,7 +5,7 @@ import type {
   NodeCommand,
   NodeConversation,
 } from '../api/types';
-import type { LiveDelta, LiveTool } from '../realtime/reduce';
+import type { LiveDelta, LiveRescue, LiveTool } from '../realtime/reduce';
 import { summarizeArgs } from './format';
 
 /**
@@ -51,11 +51,11 @@ import { summarizeArgs } from './format';
  * 声道在落地思考在场时不再折步：同一份思考只摆一遍。
  */
 
-/** 轮里的一步：五类（阶段 prompt / 话 / 思考 / 工具回执 / 命令回执）归成一个渲染形状。 */
+/** 轮里的一步：六类（阶段 prompt / 话 / 思考 / 工具回执 / 命令回执 / 读数行）归成一个渲染形状。 */
 export interface SceneStep {
   /** 渲染键，由本模块按来源与序号编好，模板不自己数。 */
   key: string;
-  kind: 'prompt' | 'text' | 'thinking' | 'tool' | 'command';
+  kind: 'prompt' | 'text' | 'thinking' | 'tool' | 'command' | 'notice';
   /** text 步的角色（user / assistant / system / tool）。其余步为 null。 */
   role: ChatMessage['role'] | null;
   /** text / thinking 步的正文；其余步为空串。 */
@@ -66,8 +66,26 @@ export interface SceneStep {
   prompt: ScenePrompt | null;
   /** 工具回执（模型发起的调用；模型侧的账）。 */
   tool: SceneTool | null;
+  /** 读数行：非交互的一行事实（票 06① 的截断救援；后来者同形）。 */
+  notice: SceneNotice | null;
   /** 命令回执（执行器侧的账，带退出码与输出）。 */
   command: SceneCommand | null;
+}
+
+/**
+ * 读数行（票 06①）：这一轮里「发生过、但不是一段话」的那件事。
+ *
+ * 与工具回执分开的理由：回执说「这次调用发生了什么」，读数行说「这次调用的内容缺了
+ * 哪几块」——后者要一眼看见，不该藏在要展开才读得到的 12k 结果正文里。
+ * **不可交互**（没有可点开的下文），与决策 362① 的省略行同一档位。
+ */
+export interface SceneNotice {
+  /** 读数类别（`truncation_rescue` = 一次截断救援）；模板据此选措辞与颜色。 */
+  kind: 'truncation_rescue';
+  /** 已经拼好的人读那一句（判断归模块，模板只渲染）。 */
+  text: string;
+  /** 升 WARN（票 06②：同一个 run 内第二次起）——红色档位与文案的分寸都由它定。 */
+  warn: boolean;
 }
 
 /** 阶段 prompt 的两段原文（决策 211② 的快照列，决策 360 起上现场时间线）。 */
@@ -166,6 +184,11 @@ export interface TaskSceneInput {
   liveDeltas: LiveDelta[];
   liveTools: LiveTool[];
   /**
+   * 截断救援的直播读数（票 06①）：按 `run_id` 接到各自的轮尾。
+   * 可选——救援不是一段话、不占正文窗口，老调用方（bench / 单测）不给即无。
+   */
+  liveRescues?: LiveRescue[];
+  /**
    * 被条数上限丢弃过增量的 run（决策 362①）。归约只据此决定**哪几轮**摆省略行——
    * 丢掉的条数与正文本就不在手里。
    */
@@ -179,7 +202,7 @@ export interface TaskSceneInput {
 type StepDraft = Omit<SceneStep, 'key'>;
 
 function textStep(role: ChatMessage['role'], text: string, streaming = false): StepDraft {
-  return { kind: 'text', role, text, streaming, prompt: null, tool: null, command: null };
+  return { kind: 'text', role, text, streaming, prompt: null, tool: null, notice: null, command: null };
 }
 
 /**
@@ -194,6 +217,7 @@ function thinkingStep(text: string): StepDraft {
     streaming: false,
     prompt: null,
     tool: null,
+    notice: null,
     command: null,
   };
 }
@@ -208,6 +232,7 @@ function promptStep(system: string | null, user: string | null): StepDraft | nul
     streaming: false,
     prompt: { system, user },
     tool: null,
+    notice: null,
     command: null,
   };
 }
@@ -220,8 +245,75 @@ function toolStep(name: string, args: string, result: string, phase: SceneTool['
     streaming: false,
     prompt: null,
     tool: { name, argsSummary: summarizeArgs(args), args, result, phase },
+    notice: null,
     command: null,
   };
+}
+
+/** 一次救援的读数：直播事件与落库的工具结果带的是**同一组字段**（dedupe 才做得了）。 */
+interface RescueReading {
+  raw_len: number;
+  missing_fields: string[];
+  rescue_count: number;
+}
+
+/** 同一轮内第几次救援起升 WARN——与后端 `events.rs::TRUNCATION_RESCUE_WARN_AFTER` 同一个数。 */
+export const TRUNCATION_RESCUE_WARN_AFTER = 2;
+
+/**
+ * 工具结果正文里的救援读数（票 06① 落库那一份）。不是救援行时给 `null`。
+ *
+ * 后端挂的键固定 `truncation_rescue`、值是对象（`model_invoke.rs::with_rescue_note`）：
+ * 读数在那一侧，**措辞在这一侧**——后端不生产页面文案。
+ */
+function rescueFromToolResult(content: string): RescueReading | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  const raw = (parsed as { truncation_rescue?: unknown })?.truncation_rescue;
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Partial<RescueReading>;
+  if (typeof r.raw_len !== 'number') return null;
+  return {
+    raw_len: r.raw_len,
+    missing_fields: Array.isArray(r.missing_fields) ? r.missing_fields : [],
+    rescue_count: typeof r.rescue_count === 'number' ? r.rescue_count : 1,
+  };
+}
+
+/**
+ * 一次截断救援的读数行（票 06①）。
+ *
+ * 措辞在这里拼（判断归模块），模板只渲染：现场页签的直播那一份与落库那一份走同一个函数，
+ * 刷新前后看到的是同一句话。字段名与字节数是**运行时数据**、不是文案——界面按原样列出。
+ */
+function rescueNoticeStep(r: RescueReading, warn: boolean): StepDraft {
+  const fields =
+    r.missing_fields.length > 0
+      ? `缺失的必填字段：${r.missing_fields.join('、')}`
+      : '必填字段都在（被截的是可选字段或正文尾部）';
+  return {
+    kind: 'notice',
+    role: null,
+    text: '',
+    streaming: false,
+    prompt: null,
+    tool: null,
+    notice: {
+      kind: 'truncation_rescue',
+      text: `参数被上游截断，已按残值救援（到达 ${r.raw_len} 字节）· ${fields} · 本轮第 ${r.rescue_count} 次`,
+      warn,
+    },
+    command: null,
+  };
+}
+
+/** 由直播事件取读数（与落库那份同形）。 */
+function readingOf(r: LiveRescue): RescueReading {
+  return { raw_len: r.raw_len, missing_fields: r.missing_fields, rescue_count: r.rescue_count };
 }
 
 function commandStep(c: NodeCommand, input: TaskSceneInput): StepDraft {
@@ -233,6 +325,7 @@ function commandStep(c: NodeCommand, input: TaskSceneInput): StepDraft {
     streaming: false,
     prompt: null,
     tool: null,
+    notice: null,
     command: {
       id: c.id,
       command: original ?? c.command,
@@ -290,6 +383,7 @@ function foldLiveStream(deltas: LiveDelta[], tools: LiveTool[]): StepDraft[] {
           result: t.result,
           phase: t.phase === 'start' ? 'running' : t.phase === 'error' ? 'bad' : 'ok',
         },
+        notice: null,
         command: null,
       });
       continue;
@@ -318,9 +412,25 @@ function foldLiveStream(deltas: LiveDelta[], tools: LiveTool[]): StepDraft[] {
  * 空 content 的 tool 行照旧剔除（旧会话页签的既有判据）。最后一条 assistant 正文是
  * 收口话，从步骤里摘出去——它就是「回话位」。
  */
-function stepsFromMessages(messages: ChatMessage[]): { steps: StepDraft[]; closing: string } {
+function stepsFromMessages(messages: ChatMessage[]): {
+  steps: StepDraft[];
+  closing: string;
+  /** 转录里已经摆出的救援行键（`raw_len:rescue_count`），直播事件据此 dedupe。 */
+  rescueKeys: string[];
+} {
   const steps: StepDraft[] = [];
   const callIndex = new Map<string, number>();
+  const rescueKeys: string[] = [];
+  /** 救援步的插入位（在循环外补插：循环中的 `callIndex` 存的是下标，插一步就会全体错位）。 */
+  const pending: { at: number; step: StepDraft }[] = [];
+  const addRescue = (at: number, r: RescueReading) => {
+    rescueKeys.push(`${r.raw_len}:${r.rescue_count}`);
+    // WARN 档位的判据与后端事件同一个数（票 06②：本轮第二次起）——落库那份本来就带着
+    // `rescue_count`，不必等事件到达才知道这是第几次。
+    pending.push({ at, step: rescueNoticeStep(r, r.rescue_count >= TRUNCATION_RESCUE_WARN_AFTER) });
+  };
+  const rescueIn = (content: string): RescueReading | null =>
+    content.startsWith('{') ? rescueFromToolResult(content) : null;
   for (const m of messages) {
     if (m.role === 'system') {
       steps.push(textStep('system', m.content ?? ''));
@@ -335,22 +445,28 @@ function stepsFromMessages(messages: ChatMessage[]): { steps: StepDraft[]; closi
     } else if (m.content) {
       // tool 结果：配回所属调用；配不上自成一条（只有结果、没有参数可摊）。
       const idx = m.tool_call_id != null ? callIndex.get(m.tool_call_id) : undefined;
+      const rescue = rescueIn(m.content);
       if (idx !== undefined) {
         const base = steps[idx];
         const tool = base.tool as SceneTool;
         steps[idx] = { ...base, tool: { ...tool, result: m.content } };
+        if (rescue) addRescue(idx + 1, rescue);
       } else {
         steps.push(toolStep(m.name ?? 'tool', '', m.content, 'ok'));
+        if (rescue) addRescue(steps.length, rescue);
       }
     }
   }
   // 收口话 = 最后一步若是 assistant 正文，摘出去。
   const last = steps[steps.length - 1];
+  let closing = '';
   if (last && last.kind === 'text' && last.role === 'assistant') {
     steps.pop();
-    return { steps, closing: last.text };
+    closing = last.text;
   }
-  return { steps, closing: '' };
+  // 从后往前插：前面的插入位不会被后面的挪走（`at` 是按未插时的下标记的）。
+  for (const one of [...pending].sort((a, b) => b.at - a.at)) steps.splice(one.at, 0, one.step);
+  return { steps, closing, rescueKeys };
 }
 
 /** 步骤草稿按来源编号补键（命令天然有 id，其余按 kind 计数；模板不自己数）。 */
@@ -367,6 +483,25 @@ function keyedSteps(drafts: StepDraft[], turnKey: string): SceneStep[] {
 /** 现场时间线归约本体（边界见模块注释）。 */
 export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
   const { conversations, commands, liveDeltas, liveTools, liveDroppedRuns = {} } = input;
+  /** 救援读数按 run 分组（票 06①），按到达序排——同一 run 里它是「第几次」的序。 */
+  const rescuesByRun = new Map<number, LiveRescue[]>();
+  for (const r of input.liveRescues ?? []) {
+    const list = rescuesByRun.get(r.run_id) ?? [];
+    list.push(r);
+    rescuesByRun.set(r.run_id, list);
+  }
+  for (const list of rescuesByRun.values()) list.sort((a, b) => a.seq - b.seq);
+  /**
+   * 直播救援行 → 读数行，**跳过转录里已经摆出的那些**（票 06①）。
+   *
+   * dedupe 键是 `raw_len:rescue_count`：同一件事的两个来源（当场到的事件、落库的工具结果
+   * 读数）带着同一对数，而这对数在一次 run 内唯一（字节数与第几次）。不 dedupe 的后果是
+   * 现场同一条救援摆两行，且其中一行在刷新后消失——那比少一行更难解释。
+   */
+  const rescueStepsFor = (runId: number, landedKeys: string[]): StepDraft[] =>
+    (rescuesByRun.get(runId) ?? [])
+      .filter((r) => !landedKeys.includes(`${r.raw_len}:${r.rescue_count}`))
+      .map((r) => rescueNoticeStep(readingOf(r), r.warn));
   const deltasByRun = new Map<number, LiveDelta[]>();
   for (const d of liveDeltas) {
     const list = deltasByRun.get(d.run_id) ?? [];
@@ -414,9 +549,13 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
     const full = input.conversationFor(runId);
     const runCommands = commandsByRun.get(runId) ?? [];
     const key = `r${runId}`;
-    const { steps: msgSteps, closing: landedClosing } = full
+    const {
+      steps: msgSteps,
+      closing: landedClosing,
+      rescueKeys: landedRescues,
+    } = full
       ? stepsFromMessages(full.messages_json)
-      : { steps: [] as StepDraft[], closing: '' };
+      : { steps: [] as StepDraft[], closing: '', rescueKeys: [] as string[] };
     // 直播流（决策 359①）：增量与工具回执按到达序交织折步。落地会话先排（历史），
     // 命令账最后排（两本账，不假装能精确交织）——收口话与流式光标在折步里落位，
     // 再拼上命令，免得命令顶走「正在说的那一句」。
@@ -458,6 +597,7 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
       ...leading,
       ...msgSteps,
       ...stream,
+      ...rescueStepsFor(runId, landedRescues),
       ...[...runCommands].sort(byStartedAt).map((c) => commandStep(c, input)),
     ];
     // 排序时刻：完整会话的 created_at → 该轮命令的最早 started_at → 空（排末尾）。
@@ -546,6 +686,7 @@ export function buildTaskScene(input: TaskSceneInput): SceneTurn[] {
     }
     const drafts: StepDraft[] = [
       ...stream,
+      ...rescueStepsFor(runId, []),
       ...[...(commandsByRun.get(runId) ?? [])].sort(byStartedAt).map((c) => commandStep(c, input)),
     ];
     episodes.push({
@@ -602,6 +743,7 @@ export function sceneTurnMatches(turn: SceneTurn, rawQuery: string): boolean {
     // 阶段 prompt 的两段原文也在滤网里（决策 360：它是现场的一部分，找得到才点得开）
     if (s.prompt) haystacks.push(s.prompt.system ?? '', s.prompt.user ?? '');
     if (s.tool) haystacks.push(s.tool.name, s.tool.argsSummary, s.tool.result);
+    if (s.notice) haystacks.push(s.notice.text);
     if (s.command)
       haystacks.push(s.command.command, s.command.actualCommand, s.command.output ?? '');
   }

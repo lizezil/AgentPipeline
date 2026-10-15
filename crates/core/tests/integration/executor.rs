@@ -2323,6 +2323,170 @@ async fn a_rescued_truncation_with_all_required_fields_still_succeeds() {
     );
 }
 
+// ─────────────────── 截断救援的显性化（票 06①②）───────────────────
+
+/// 救援发生过 → 任务面上必须看得见：`truncation_rescue` 事件带缺失必填清单、台账那一行
+/// 收场成 `error` 并写明缺哪几块、落库的工具结果正文带同一份结构化读数。
+///
+/// 为什么三条都要钉：票 06 治的是「有损救援零可见」——此前只有一行 `tracing::warn`，
+/// 进程没了就什么都查不到，任务面上照样绿灯。三处落点各自回答一个问题：
+/// 事件=「正在跑的时候告不告得出来」，台账=「事后按 run 查得到吗」，转录=「刷新后
+/// 现场页签还看得见吗」（前端与直播事件对账就靠这一份落库读数）。
+#[tokio::test]
+async fn a_lossy_rescue_is_visible_in_events_the_ledger_and_the_transcript() {
+    let settings = Settings {
+        agent_retry_max: 1,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    // 现场实测残片（conv 99）：救得回来，但必填 `readiness` 被截掉了
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .submit_metadata_raw(r#"{"blockers": [], "feedback": "#);
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "rescue-vis", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "rescue-vis").await;
+    ctx.executor.run("rescue-vis").await.unwrap();
+
+    // ① 事件：缺失清单要说得出 `readiness`，第一次救援不升 WARN
+    let rescues: Vec<_> = ctx
+        .sse
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            SseEvent::TruncationRescue {
+                run_id,
+                tool,
+                raw_len,
+                missing_fields,
+                rescue_count,
+                warn,
+                ..
+            } => Some((run_id, tool, raw_len, missing_fields, rescue_count, warn)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rescues.len(),
+        1,
+        "一轮截断只该留一条救援事件（脚本只喂了一次残片）：{rescues:?}"
+    );
+    let (run_id, tool, raw_len, missing, count, warn) = rescues[0].clone();
+    assert_eq!(tool, "submit_metadata");
+    assert_eq!(
+        missing,
+        vec!["readiness".to_string()],
+        "缺失必填清单要按本阶段 schema 报得出字段名"
+    );
+    assert_eq!(count, 1, "本 run 第一次救援");
+    assert!(!warn, "单次救援不该就报警");
+    assert!(
+        raw_len > 0 && raw_len < 40,
+        "到达字节数是真的参数长度：{raw_len}"
+    );
+
+    // ② 台账：那一行不能记 `ok`，且要写清「参数被腰斩 + 缺哪几块」
+    let rows = ctx.store.model_requests_for_run(run_id, 20).await.unwrap();
+    let broken = rows
+        .iter()
+        .find(|r| {
+            r.status == agentpipeline_core::storage::ModelRequestStatus::Error
+                && r.error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("工具参数不是合法 JSON")
+        })
+        .expect("救援那一轮在请求台账里要认得出（且不许记 ok）");
+    let note = broken.error.clone().unwrap_or_default();
+    assert!(
+        note.contains("缺失的必填字段") && note.contains("readiness"),
+        "台账 note 要报出缺的那几块：{note}"
+    );
+
+    // ③ 转录：落库的工具结果正文带结构化读数——刷新后页面靠它对上同一条救援
+    let convs: Vec<_> = ctx
+        .store
+        .list_conversations("rescue-vis", true)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.run_id == run_id)
+        .collect();
+    let carried = convs.iter().any(|c| {
+        c.messages_json.as_array().into_iter().flatten().any(|m| {
+            m["role"].as_str() == Some("tool")
+                && m["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("truncation_rescue")
+        })
+    });
+    assert!(
+        carried,
+        "救援读数要落进转录的工具结果（否则刷新后现场页签看不见）"
+    );
+}
+
+/// 同一 run 内第二次救援 → 升 WARN（票 06②）。
+///
+/// 阈值放在这一条上是有原因的：一次截断可能是网关抖动，连着两次说明这一轮**真的**在
+/// 反复丢正文（2026-09-30 那条链上 `validate_output` 连挂三次）。计数按 run 现推，
+/// 所以断言必须落在同一 run 的两条事件上——跨 attempt 的两条各算各的 run，不该升档。
+#[tokio::test]
+async fn the_second_rescue_in_a_run_raises_the_warn_grade() {
+    let settings = Settings {
+        agent_retry_max: 1,
+        ..Default::default()
+    };
+    let ctx = setup("true", settings).await;
+    let mut script = Script::new();
+    script
+        .for_node(Stage::ArchitectDesign, Node::ValidateInput)
+        .submit(&ValidateInputMetadata {
+            readiness: true,
+            blockers: vec![],
+        });
+    // 同一个 run 里连着两次腰斩（模型换个写法再发一次，又被截在同一处）
+    script
+        .for_node(Stage::ArchitectDesign, Node::Execute)
+        .submit_metadata_raw(r#"{"blockers": [], "feedback": "#)
+        .submit_metadata_raw(r#"{"blockers": [], "feedback": "#);
+    ctx.agent.set_script(script);
+
+    testkit::seed_task(&ctx.store, "rescue-warn", "p1")
+        .await
+        .unwrap();
+    admit(&ctx, "rescue-warn").await;
+    ctx.executor.run("rescue-warn").await.unwrap();
+
+    let grades: Vec<(usize, bool)> = ctx
+        .sse
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            SseEvent::TruncationRescue {
+                rescue_count, warn, ..
+            } => Some((rescue_count, warn)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        grades,
+        vec![(1, false), (2, true)],
+        "第 1 次不升档、第 2 次升 WARN，且计数在本 run 内递增"
+    );
+}
+
 // ─────────────────── 失败路径的会话落库（决策 211① / 票 01）───────────────────
 #[tokio::test]
 async fn llm_failure_writes_a_conversation_row_with_the_reason() {

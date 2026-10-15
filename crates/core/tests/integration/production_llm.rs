@@ -272,6 +272,93 @@ async fn a_final_line_without_a_trailing_newline_is_still_parsed() {
     mock.shutdown().await;
 }
 
+/// 一台把 SSE 正文**在指定字节处切成两块**分别写出的 raw server。
+///
+/// 它要造的形状是 `MockRoute::sse` 造不出来的：`MockLlm` 一次写完整个 body，于是
+/// 「一个多字节字符横跨两次 `stream.next()`」这件事在测试里就没发生过（票 06 · 决策 431
+/// 的现场）。这里分两次 `write_all` 并在中间 `flush`，切点由调用方按字节算好递进来。
+async fn spawn_stream_split_in_two(
+    body: &[u8],
+    split_at: usize,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = body.to_vec();
+    let handle = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let mut read_total = 0usize;
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            read_total += n;
+            if n == 0 || buf[..read_total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+            .await
+            .unwrap();
+        sock.write_all(&body[..split_at]).await.unwrap();
+        sock.flush().await.unwrap();
+        // 让第一块真的先到达对面（同一批次写出的两块会被合成一个 chunk，那就白切了）。
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        sock.write_all(&body[split_at..]).await.unwrap();
+        sock.flush().await.unwrap();
+        sock.shutdown().await.unwrap();
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// 票 106-stability/06 · 决策 431：**跨块切开的中文字符不许变成 U+FFFD**。
+///
+/// 「设计.md」的「设」= `E8 AE BE`，切点落在它的首字节之后——第一块的尾巴是 `E8`，
+/// 单看这一块它不是合法 UTF-8。旧写法在这里 `from_utf8_lossy` 一次，`E8` 就地变成
+/// `\u{FFFD}`：参数被静默污染，`submit_metadata` 拿到一个看着正常的坏值，而**没有任何
+/// 一处会报错**。这条用例从真 HTTP 流打进来，钉的是收口后的那一份参数原文。
+#[tokio::test]
+async fn a_multibyte_char_split_across_tcp_chunks_reaches_the_tool_intact() {
+    let home = TestHome::new().unwrap();
+    let (store, _clock) = home.setup().await.unwrap();
+    let body = r##"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"@@NAME@@\"}"}}]},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"##
+    .replace("@@NAME@@", "设计.md");
+    let bytes = body.as_bytes();
+    // 切点 = 「设」首字节之后一位：第一块以孤立的 0xE8 收尾。
+    let at = bytes
+        .iter()
+        .position(|b| *b == 0xE8)
+        .expect("正文里要有那个三字节字符")
+        + 1;
+    let (url, server) = spawn_stream_split_in_two(bytes, at).await;
+    store
+        .upsert_provider(&provider("openai", "gpt-x", &url, "p-utf8"))
+        .await
+        .unwrap();
+    let run_id = seed_run(&store, "t1").await;
+
+    let client = ProductionLlm::new(store.clone(), Arc::new(SseRecorder::new()));
+    let response = client
+        .complete(request(run_id, vec![]))
+        .await
+        .expect("两块拼起来是一条完整的流");
+    let args = &response.tool_calls[0].arguments;
+    assert!(
+        !args.contains('\u{FFFD}'),
+        "跨块的多字节字符不许被换成 U+FFFD：{args:?}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(args).is_ok(),
+        "参数得仍是合法 JSON：{args:?}"
+    );
+    assert!(args.contains("设计"), "正文里的中文要原样到达：{args:?}");
+    // 正文那一路同理：这条流只有工具增量，正文空不影响上面的断言。
+    assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    server.abort();
+}
+
 /// 参数不是合法 JSON（上游按 `length` 切断输出）→ `complete` 照旧成功返回
 /// （残片还要交给 `rescue_truncated_json` 去救），但**模型请求台账不许记 `ok`**。
 #[tokio::test]

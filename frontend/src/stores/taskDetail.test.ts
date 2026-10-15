@@ -564,6 +564,15 @@ describe('落地即清（决策 362②）：正文到手后收走该 run 的直�
     result: 'r',
     seq,
   });
+  const liveRescue = (runId: number, count: number, seq: number) => ({
+    run_id: runId,
+    tool: 'submit_metadata',
+    raw_len: 31,
+    missing_fields: ['readiness'],
+    rescue_count: count,
+    warn: count >= 2,
+    seq,
+  });
   /** 两条 run 都在冒，其中 run 1 被上限丢弃过（标记与增量一起受落地清理管）。 */
   const armLive = (): void => {
     taskDetail.id = 'A';
@@ -571,6 +580,7 @@ describe('落地即清（决策 362②）：正文到手后收走该 run 的直�
       conversations: [summary(1), summary(2)],
       liveDeltas: [liveDelta(1, '甲在冒', 0), liveDelta(2, '乙在冒', 1)],
       liveTools: [liveTool(1, 2)],
+      liveRescues: [liveRescue(1, 1, 3), liveRescue(2, 1, 4)],
       liveDroppedRuns: { 1: true },
     });
     taskDetail.conversationsFull = {};
@@ -584,6 +594,8 @@ describe('落地即清（决策 362②）：正文到手后收走该 run 的直�
 
     expect(taskDetail.state.liveDeltas.map((d) => d.run_id)).toEqual([2]);
     expect(taskDetail.state.liveTools).toEqual([]);
+    // 救援行同一路（票 06①）：它落库的那一份由转录摆出，直播那一份不留在场上
+    expect(taskDetail.state.liveRescues.map((r) => r.run_id)).toEqual([2]);
   });
 
   it('批量装载落地同样清（一次拿回的那条路）', async () => {
@@ -651,6 +663,27 @@ describe('落地即清（决策 362②）：正文到手后收走该 run 的直�
 
     expect(taskDetail.state.liveDeltas.map((d) => d.run_id)).toEqual([1]);
     expect(taskDetail.state.liveDroppedRuns).toEqual({ 1: true });
+  });
+
+  it('晚到的救援事件同样当场收走（票 06①：落地后不该再摆直播那一份）', () => {
+    armLive();
+    taskDetail.conversationsFull = { 2: conversation(2) };
+
+    taskDetail.handleEvent({
+      type: 'truncation_rescue',
+      task_id: 'A',
+      branch: 'main',
+      stage: 'develop',
+      node: 'execute',
+      run_id: 2,
+      tool: 'submit_metadata',
+      raw_len: 31,
+      missing_fields: ['readiness'],
+      rescue_count: 2,
+      warn: true,
+    });
+
+    expect(taskDetail.state.liveRescues.map((r) => r.run_id)).toEqual([1]);
   });
 
   it('没有任何正文落地时不扫也不动（在飞的轮照旧）', () => {

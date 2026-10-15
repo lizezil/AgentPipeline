@@ -27,6 +27,8 @@ pub enum SseEventType {
     /// 决策 207：值班长提议的到达 / 作废（只读事件）。
     ForemanProposal,
     ToolEvent,
+    /// 票 06①：一次截断救援（被截字段清单 + 是否升到 WARN）。
+    TruncationRescue,
     Stalled,
     TaskCancelled,
     TaskDone,
@@ -198,7 +200,30 @@ pub enum SseEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seq: Option<u64>,
     },
-    Stalled {
+    /// 一次**截断救援**（票 06①②）：上游把 `submit_metadata` 的参数腰斩，本地按残值救回后
+    /// 流程照走——此前这件事只有一行 `tracing::warn`，任务面上**零可见**。
+    ///
+    /// 与工具回执分开放：`tool_event` 说「这次调用发生了什么」，这条说「这次调用的**内容
+    /// 缺了哪几块**」——后者才是排障要的答案，藏在 12k 上限的结果正文里等于没有。
+    ///
+    /// `warn` = 同一个 run 内救援 ≥2 次（票 06②：连续截断 = 上游在挤牙膏，值得人知道）。
+    /// 计数由转录现推，不另设状态位——转录本来就是「这一轮说过几次」的真相源。
+    TruncationRescue {
+        task_id: String,
+        branch: String,
+        run_id: i64,
+        stage: Stage,
+        node: Node,
+        /// 被截断的那次调用的工具名（今天是 `submit_metadata`；带上它，别处将来同形时不用再改事件面）。
+        tool: String,
+        /// 腰斩后**实际到达**的字节数（现场实测 29–7748 字节那一族读数）。
+        raw_len: usize,
+        /// schema 必填里没到的那些字段名（空 = 必填都到了，被截的是可选字段或正文尾部）。
+        missing_fields: Vec<String>,
+        /// 这是本 run 内第几次救援（≥1）。
+        rescue_count: usize,
+        warn: bool,
+    },
         task_id: String,
         branch: String,
         pending_hours: u64,
@@ -233,6 +258,7 @@ impl SseEvent {
             SseEvent::ConversationDelta { .. } => SseEventType::ConversationDelta,
             SseEvent::ForemanProposal { .. } => SseEventType::ForemanProposal,
             SseEvent::ToolEvent { .. } => SseEventType::ToolEvent,
+            SseEvent::TruncationRescue { .. } => SseEventType::TruncationRescue,
             SseEvent::Stalled { .. } => SseEventType::Stalled,
             SseEvent::TaskCancelled { .. } => SseEventType::TaskCancelled,
             SseEvent::TaskDone { .. } => SseEventType::TaskDone,
@@ -255,6 +281,7 @@ impl SseEvent {
             | SseEvent::ConversationDelta { branch, .. }
             | SseEvent::ForemanProposal { branch, .. }
             | SseEvent::ToolEvent { branch, .. }
+            | SseEvent::TruncationRescue { branch, .. }
             | SseEvent::Stalled { branch, .. }
             | SseEvent::TaskCancelled { branch, .. }
             | SseEvent::TaskDone { branch, .. }
@@ -305,6 +332,7 @@ impl SseEvent {
             | SseEvent::ConversationDelta { task_id, .. }
             | SseEvent::ForemanProposal { task_id, .. }
             | SseEvent::ToolEvent { task_id, .. }
+            | SseEvent::TruncationRescue { task_id, .. }
             | SseEvent::Stalled { task_id, .. }
             | SseEvent::TaskCancelled { task_id, .. }
             | SseEvent::TaskDone { task_id, .. }
