@@ -1168,7 +1168,7 @@ impl Executor {
     async fn done_execute(&self, task: &Task, cursor: &NodeCursor) -> Result<NodeOutput> {
         let (run_id, attempt) = self.begin_run(task, cursor, "system").await?;
         let started = self.clock.now();
-        let result = self.do_done(task, run_id).await;
+        let result = self.do_done(task, run_id, &cursor.branch).await;
         self.finish_run(
             run_id,
             task,
@@ -1188,7 +1188,7 @@ impl Executor {
         Ok(NodeOutput::Route(crate::pipeline::MetadataView::default()))
     }
 
-    async fn do_done(&self, task: &Task, run_id: i64) -> Result<()> {
+    async fn do_done(&self, task: &Task, run_id: i64, event_branch: &str) -> Result<()> {
         let merged = self
             .store
             .merge_metadata(&task.id)
@@ -1200,7 +1200,33 @@ impl Executor {
                 "done 需要 merge_result.status = merged（未合入不得进入终态）".into(),
             ));
         }
+        let mut reclaim_note = String::new();
         if let Some(worktree) = &task.worktree_path {
+            // 票 106-stability/07①：**先收产物、再动 git**。顺序是有意的——下面那条
+            // `remove_worktree` 报错时 `?` 会把 done 整条路打断（任务进不了终态），
+            // 那 1.4GB 若是等「以后某个时刻」再收，就又是「恰好被清」而不是机制保证。
+            // 回收本身尽力而为：它不返回错误，失败只体现在读数里（0 释放 + WARN）。
+            let stats =
+                crate::prune::reclaim_terminal_worktree(self.store.home(), Path::new(worktree))
+                    .await;
+            if stats.worth_reporting() {
+                super::events::emit_worktree_reclaim(
+                    &*self.sse,
+                    &task.id,
+                    event_branch,
+                    crate::sse::ReclaimTrigger::Done,
+                    &stats,
+                );
+                tracing::info!(
+                    task = %task.id,
+                    freed_bytes = stats.freed_bytes,
+                    target_bytes = stats.bytes_of("target"),
+                    rows_bytes = stats.bytes_of(".rows"),
+                    uncommitted = stats.uncommitted.len(),
+                    "{}", stats.summary_line()
+                );
+                reclaim_note = format!("｜{}", stats.summary_line());
+            }
             self.mark_step(run_id, "回收 worktree 与任务分支").await;
             let project = project_or_err(&self.store, &task.project_id).await?;
             Git.remove_worktree(Path::new(&project.local_path), Path::new(worktree), true)
@@ -1212,7 +1238,8 @@ impl Executor {
             // 构建缓存回收（票 runner-offload/03 / B5）：任务构建活动结束的确定性时刻。
             crate::prune::prune_build_cache(self.store.home()).await;
         }
-        self.mark_step(run_id, "置任务终态").await;
+        self.mark_step(run_id, &format!("置任务终态{reclaim_note}"))
+            .await;
         self.store
             .mark_terminal(&task.id, crate::types::TaskStatus::Done)
             .await?;

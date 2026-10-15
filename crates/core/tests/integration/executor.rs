@@ -293,12 +293,65 @@ async fn executor_drives_full_happy_path_to_done() {
         .apply_merge_decision("t1", MergeDecision::Approve, false)
         .await
         .unwrap();
+    // 票 106-stability/07①②：终态前把 worktree 养成「106 上那个任务」的样子——
+    // 一份 cargo 产物、一份 ux-audit 那族的运行期工件、一份没提交的草稿。
+    let wt_path = ctx._home.home().worktree_path("t1");
+    const TARGET_BYTES: usize = 2 * 1024 * 1024;
+    const ROWS_BYTES: usize = 1024;
+    std::fs::create_dir_all(wt_path.join("target/debug")).unwrap();
+    std::fs::write(
+        wt_path.join("target/debug/libfoo.rlib"),
+        vec![0u8; TARGET_BYTES],
+    )
+    .unwrap();
+    std::fs::create_dir_all(wt_path.join(".rows")).unwrap();
+    std::fs::write(wt_path.join(".rows/201.md"), vec![b'x'; ROWS_BYTES]).unwrap();
+    std::fs::write(wt_path.join("rescue-notes.md"), "还没提交的活儿").unwrap();
     ctx.executor.run("t1").await.unwrap();
 
     let task = ctx.store.get_task("t1").await.unwrap();
     assert_eq!(task.status, TaskStatus::Done);
     let worktree = ctx._home.home().worktree_path("t1");
     assert!(!worktree.exists(), "done 应清理 worktree（决策 3）");
+    // 票 07②：回收的读数落一条事件（谁下的手、收了多少、留下了什么在等人）。
+    let reclaimed = ctx
+        .sse
+        .last_of(SseEventType::WorktreeReclaim)
+        .expect("终态回收产物要出一条事件，不是一行 warn");
+    match reclaimed {
+        agentpipeline_core::sse::SseEvent::WorktreeReclaim {
+            task_id,
+            trigger,
+            freed_bytes,
+            uncommitted,
+            refused,
+            ..
+        } => {
+            assert_eq!(task_id, "t1");
+            assert_eq!(trigger, agentpipeline_core::sse::ReclaimTrigger::Done);
+            assert_eq!(freed_bytes, (TARGET_BYTES + ROWS_BYTES) as u64);
+            assert!(!refused);
+            assert!(
+                uncommitted.iter().any(|l| l.contains("rescue-notes.md")),
+                "未提交改动只列不改，那份清单是留给人的：{uncommitted:?}"
+            );
+        }
+        other => panic!("不该是这个形状：{other:?}"),
+    }
+    // 落地面：done 那条 system run 的步骤文本带着释放量（事件是瞬时的，这一行是查得到的）。
+    let done_run = ctx
+        .store
+        .list_runs_at("t1", Stage::Done, Node::Execute)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("done 应有 system run");
+    let step = done_run.step.expect("done 的收口步骤");
+    assert!(
+        step.contains("产物回收") && step.contains("2 MB"),
+        "终态那一步要说清收了多少：{step}"
+    );
     assert!(!ctx.repo.branch_exists("kanban/t1"), "done 应删除任务分支");
     // 主干真的前进了（决策 97 回归点）
     assert_ne!(ctx.repo.head("main"), base_commit);

@@ -390,6 +390,7 @@ export type SseEventType =
   | 'conversation_delta'
   | 'tool_event'
   | 'truncation_rescue'
+  | 'worktree_reclaim'
   | 'stalled'
   | 'task_cancelled'
   | 'task_done'
@@ -527,6 +528,38 @@ export interface TruncationRescueEvent extends SseBase {
   /** 同一个 run 内 ≥2 次（票 06②：上游在挤牙膏，值得人知道）。 */
   warn: boolean;
 }
+/** 一次产物回收的**逐项**读数：`WORKTREE_ARTIFACT_DIRS` 每个名字一条（含 0 的那些）。 */
+export interface ReclaimItem {
+  name: string;
+  freed_bytes: number;
+}
+
+/** 谁下的手（票 106-stability/07）：同一个回收动作有五个入口，「谁清的」是读数的一部分。 */
+export type ReclaimTrigger = 'done' | 'cancel' | 'archive' | 'split' | 'maintenance';
+
+/**
+ * 终态 worktree 的产物回收（票 106-stability/07，决策 433）。
+ *
+ * **契约登记，界面不消费**：回收的读数落在三处查得到的地方——Done 那步的 `step`
+ * 文本、`tracing::info!` 字段、`MaintenanceReport`；事件面登记在这里是为了
+ * 「加事件 = 加类型成员」这条口径不烂（决策 249），`reduce.ts` 与
+ * `notificationPolicy.ts` 各走自己的 `default` 分支，本票不为此开新的界面。
+ */
+export interface WorktreeReclaimEvent extends SseBase {
+  type: 'worktree_reclaim';
+  /** 谁下的手。 */
+  trigger: ReclaimTrigger;
+  /** 本次收回的总字节数。 */
+  freed_bytes: number;
+  /** 逐项读数（含 0 项，见 [`ReclaimItem`] 的注释）。 */
+  per_dir: ReclaimItem[];
+  /** 保留下来的 `.scratch/` 文件数（只数不改）。 */
+  kept_scratch_files: number;
+  /** 保留下来的未提交改动清单（`XY path`）——留给人的，回收不碰它。 */
+  uncommitted: string[];
+  /** 拒绝执行（路径不在 worktrees 直属层 / 产物名是符号链接）——拒绝也播报。 */
+  refused: boolean;
+}
 export interface StalledEvent extends SseBase {
   type: 'stalled';
   pending_hours: number;
@@ -554,6 +587,7 @@ export type SseEvent =
   | ConversationDeltaEvent
   | ToolEventEvent
   | TruncationRescueEvent
+  | WorktreeReclaimEvent
   | StalledEvent
   | TaskCancelledEvent
   | TaskDoneEvent

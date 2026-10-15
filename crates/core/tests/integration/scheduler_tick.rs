@@ -1679,6 +1679,111 @@ async fn maintenance_refreshes_totals_and_purges_expired_conversations() {
     assert_eq!(h.store.count_node_messages(run_id).await.unwrap(), 0);
 }
 
+/// 盘压兜底的**动作**（票 106-stability/07③）：水位判据在 `prune.rs` 的纯函数单测里钉，
+/// 这里钉「动手时只收产物、只碰已终态的那些」。两条都不许换：判据换成动作侧读盘，
+/// 就没法在不填满 CI 磁盘的情况下逼出分支；动作换成整目录删除，盘压时会顺手毁掉
+/// 未提交的活儿（票面边界：只列不改）。
+#[tokio::test]
+async fn the_disk_pressure_sweep_takes_artifacts_from_terminal_worktrees_only() {
+    use agentpipeline_core::prune::WORKTREE_ARTIFACT_DIRS;
+    use agentpipeline_core::scheduler::reclaim_terminal_worktrees;
+    use agentpipeline_core::sse::{ReclaimTrigger, SseEvent};
+
+    const TARGET_BYTES: usize = 3 * 1024 * 1024;
+    let h = Harness::new().await;
+    let fake_worktree = |task_id: &str| {
+        let wt = h._home.home().worktree_path(task_id);
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/libfoo.rlib"), vec![0u8; TARGET_BYTES]).unwrap();
+        std::fs::create_dir_all(wt.join(".scratch")).unwrap();
+        std::fs::write(wt.join(".scratch/handoff.md"), "留给人的过程草稿").unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/lib.rs"), b"fn a() {}").unwrap();
+        wt
+    };
+    let terminal_wt = fake_worktree("t9");
+    let running_wt = fake_worktree("t10");
+    for (task_id, wt) in [("t9", &terminal_wt), ("t10", &running_wt)] {
+        h.seed_task(task_id).await;
+        h.store
+            .set_task_worktree(
+                task_id,
+                &wt.display().to_string(),
+                &format!("kanban/{task_id}"),
+            )
+            .await
+            .unwrap();
+    }
+    // 只有 t9 落终态（cancelled）——t10 照旧在跑，正是票面那句「不动运行中任务的 worktree」。
+    h.store
+        .mark_terminal("t9", TaskStatus::Cancelled)
+        .await
+        .unwrap();
+
+    let (count, freed) = reclaim_terminal_worktrees(&h.store, &h.sse, h._home.home())
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1, "候选清单只认终态行");
+    assert_eq!(freed, TARGET_BYTES as u64, "target 整目录收回");
+    assert!(!terminal_wt.join("target").exists(), "产物必须消失");
+    assert!(
+        terminal_wt.join(".scratch/handoff.md").exists(),
+        ".scratch/ 是过程草稿，不是产物"
+    );
+    assert!(
+        terminal_wt.join("src/lib.rs").exists(),
+        "名单外的目录一个字不动"
+    );
+    assert!(
+        terminal_wt.is_dir(),
+        "兜底只收产物，不删整个 worktree——那是 §12.1 终态流程的决定"
+    );
+    assert!(
+        running_wt.join("target").exists(),
+        "在跑的任务被整条排除在候选清单之外"
+    );
+
+    let event = h
+        .sse
+        .last_of(SseEventType::WorktreeReclaim)
+        .expect("每一次有读数的回收都出一条事件");
+    match event {
+        SseEvent::WorktreeReclaim {
+            task_id,
+            trigger,
+            freed_bytes,
+            per_dir,
+            kept_scratch_files,
+            refused,
+            ..
+        } => {
+            assert_eq!(task_id, "t9");
+            assert_eq!(trigger, ReclaimTrigger::Maintenance, "谁下的手要写在读数里");
+            assert_eq!(freed_bytes, TARGET_BYTES as u64);
+            assert_eq!(
+                per_dir.len(),
+                WORKTREE_ARTIFACT_DIRS.len(),
+                "逐项读数含 0 的那些名字：缺项会让人以为名单与实删是两套"
+            );
+            assert_eq!(kept_scratch_files, 1);
+            assert!(!refused);
+        }
+        other => panic!("不该是这个形状：{other:?}"),
+    }
+
+    // 幂等：第二次没有东西可收，不刷第二条空事件（目录本来不存在是常态，不是消息）。
+    let (count2, freed2) = reclaim_terminal_worktrees(&h.store, &h.sse, h._home.home())
+        .await
+        .unwrap();
+    assert_eq!((count2, freed2), (0, 0));
+    assert_eq!(
+        h.sse.count_of(SseEventType::WorktreeReclaim),
+        1,
+        "无事可做的第二趟不许播报"
+    );
+}
+
 /// 指标聚合不许把 done 任务的「刚完成」洗掉（2026-10-04 实测事故）。
 ///
 /// 链条：小时级维护 `aggregate_node_metrics` → `refresh_task_totals` 无条件

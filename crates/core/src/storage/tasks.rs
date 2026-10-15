@@ -658,6 +658,23 @@ impl Store {
         Ok(())
     }
 
+    /// **盘压兜底**的候选清单（票 106-stability/07③）：已落终态、且 `worktree_path`
+    /// 有值的任务 `(id, worktree_path)`。
+    ///
+    /// 含归档行——归档是「这条任务不再看了」的意图，不是「它的目录可以继续吃盘」：
+    /// 106 上那个 2.8GB 的残留恰是**已取消并已归档**的任务留下的。
+    /// 走维护连接（决策 321：与保留期清理同类，重负载日不把主池拖进慢语句）。
+    pub async fn terminal_worktree_paths(&self) -> Result<Vec<(String, String)>> {
+        let mut conn = self.maintenance_connection().await?;
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, worktree_path FROM kanban_tasks
+             WHERE status IN ('done','failed','cancelled') AND worktree_path IS NOT NULL",
+        )
+        .fetch_all(&mut conn)
+        .await?;
+        Ok(rows)
+    }
+
     /// 看板列归属：按有无 pending 游标区分（决策 92）。
     pub async fn tasks_with_live_cursors(&self) -> Result<Vec<(Task, Vec<NodeCursor>)>> {
         let tasks = self

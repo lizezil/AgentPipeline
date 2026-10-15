@@ -110,6 +110,43 @@ pub(crate) fn emit_truncation_rescue(
     });
 }
 
+/// 一次**终态 worktree 产物回收**的唯一出口（票 106-stability/07②）。
+///
+/// 「什么时候值得播报」住在这里、与事件形状同处：四个终态入口 + 维护作业各自决定要不要发，
+/// 就会出现「done 报了、归档没报」这种没人能对照的面。判据是 [`ReclaimStats::worth_reporting`]：
+/// 什么都没收回、也没有未提交改动在等人时保持安静（目录本来不存在是常态，不是消息）。
+///
+/// `branch` 由调用点给（终态那条路有游标，取消 / 归档 / 维护那条路没有——它们用
+/// [`NodeCursor::BRANCH_MAIN`]，与 `TaskCancelled` / `Pending` 的同一条口径）。
+pub fn emit_worktree_reclaim(
+    sse: &dyn SseSink,
+    task_id: &str,
+    branch: &str,
+    trigger: crate::sse::ReclaimTrigger,
+    stats: &crate::prune::ReclaimStats,
+) {
+    if !stats.worth_reporting() {
+        return;
+    }
+    sse.emit(SseEvent::WorktreeReclaim {
+        task_id: task_id.to_string(),
+        branch: branch.to_string(),
+        trigger,
+        freed_bytes: stats.freed_bytes,
+        per_dir: stats
+            .per_dir
+            .iter()
+            .map(|(name, bytes)| crate::sse::ReclaimItem {
+                name: name.clone(),
+                freed_bytes: *bytes,
+            })
+            .collect(),
+        kept_scratch_files: stats.kept_scratch_files,
+        uncommitted: stats.uncommitted.clone(),
+        refused: stats.refused.is_some(),
+    });
+}
+
 /// `NodeStarted` 的唯一出口（形状只此一处；留守核的 begin 与编排片的带链开立都走它）。
 pub(crate) fn emit_node_started(
     sse: &dyn SseSink,

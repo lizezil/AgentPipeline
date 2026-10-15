@@ -29,10 +29,39 @@ pub enum SseEventType {
     ToolEvent,
     /// 票 06①：一次截断救援（被截字段清单 + 是否升到 WARN）。
     TruncationRescue,
+    /// 票 106-stability/07：一次终态 worktree 的产物回收（释放了多少字节、保留了什么）。
+    WorktreeReclaim,
     Stalled,
     TaskCancelled,
     TaskDone,
     TaskFailed,
+}
+
+/// 一次产物回收的**逐项**读数：`WORKTREE_ARTIFACT_DIRS` 里的每个名字一条（含 0）。
+///
+/// 摊成 `{name, freed_bytes}` 而不是 `target_bytes` / `rows_bytes` 两个字段：名单是判据、
+/// 字段是抄本，抄本会漂（决策 258 那一课在这里的形态）。加一个新产物目录时事件面不动。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReclaimItem {
+    pub name: String,
+    pub freed_bytes: u64,
+}
+
+/// 谁下的手（票 106-stability/07）。同一个回收动作有五个入口，「谁清的」是读数的一部分——
+/// 现场欠账那种「盘满了，但不知道是机制清的还是人清的」就是这么来的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReclaimTrigger {
+    /// `done.execute` 收口。
+    Done,
+    /// `POST /tasks/{id}/cancel`。
+    Cancel,
+    /// `POST /tasks/{id}/archive`。
+    Archive,
+    /// 拆分任务时旧任务落终态。
+    Split,
+    /// 小时级维护的盘压兜底清扫。
+    Maintenance,
 }
 
 /// SSE 事件体。
@@ -224,6 +253,32 @@ pub enum SseEvent {
         rescue_count: usize,
         warn: bool,
     },
+    /// 一次**终态 worktree 的产物回收**（票 106-stability/07②）：清了什么、放出多少字节、
+    /// 留下了什么在等人。
+    ///
+    /// 为什么要一条事件而不是一行 `tracing::warn`：`prune.rs` 的整段动机是「不是恰好被清，
+    /// 是机制保证」——而机制保证需要**可核对**：盘面掉了 1.4GB 时，日志里得有一句「谁下的手、
+    /// 收了多少」，否则下一次巡检还是在猜（票 01 监控实录的原始病症）。
+    ///
+    /// 与 `task_done` / `task_cancelled` 分开放：那两条说「任务到哪一步了」，这条说
+    /// 「为了这件事，磁盘动了什么」——同一时刻的两件事，混进一条会让终态事件带上体积读数。
+    WorktreeReclaim {
+        task_id: String,
+        branch: String,
+        trigger: ReclaimTrigger,
+        /// 本次收回的总字节数。
+        freed_bytes: u64,
+        /// 逐项读数（含 0 项，见 [`ReclaimItem`] 的注释）。
+        per_dir: Vec<ReclaimItem>,
+        /// 保留下来的 `.scratch/` 文件数（只数不改）。
+        kept_scratch_files: usize,
+        /// 保留下来的未提交改动清单（`XY path`；上限 50 条，超出时截断的是名字靠后的那些）。
+        uncommitted: Vec<String>,
+        /// 拒绝执行（路径不在 `{home}/worktrees/` 直属层，或产物名是符号链接）——
+        /// 拒绝也播报，静默的兜底等于没有兜底。
+        refused: bool,
+    },
+    Stalled {
         task_id: String,
         branch: String,
         pending_hours: u64,
@@ -259,6 +314,7 @@ impl SseEvent {
             SseEvent::ForemanProposal { .. } => SseEventType::ForemanProposal,
             SseEvent::ToolEvent { .. } => SseEventType::ToolEvent,
             SseEvent::TruncationRescue { .. } => SseEventType::TruncationRescue,
+            SseEvent::WorktreeReclaim { .. } => SseEventType::WorktreeReclaim,
             SseEvent::Stalled { .. } => SseEventType::Stalled,
             SseEvent::TaskCancelled { .. } => SseEventType::TaskCancelled,
             SseEvent::TaskDone { .. } => SseEventType::TaskDone,
@@ -282,6 +338,7 @@ impl SseEvent {
             | SseEvent::ForemanProposal { branch, .. }
             | SseEvent::ToolEvent { branch, .. }
             | SseEvent::TruncationRescue { branch, .. }
+            | SseEvent::WorktreeReclaim { branch, .. }
             | SseEvent::Stalled { branch, .. }
             | SseEvent::TaskCancelled { branch, .. }
             | SseEvent::TaskDone { branch, .. }
@@ -333,6 +390,7 @@ impl SseEvent {
             | SseEvent::ForemanProposal { task_id, .. }
             | SseEvent::ToolEvent { task_id, .. }
             | SseEvent::TruncationRescue { task_id, .. }
+            | SseEvent::WorktreeReclaim { task_id, .. }
             | SseEvent::Stalled { task_id, .. }
             | SseEvent::TaskCancelled { task_id, .. }
             | SseEvent::TaskDone { task_id, .. }

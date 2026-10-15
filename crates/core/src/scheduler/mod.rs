@@ -191,6 +191,31 @@ impl KanbanScheduler {
             crate::pipeline::repair::recycle_unpressed_repair_worktrees(&self.store, cutoff)
                 .await?;
         let purged_proposals = self.store.purge_foreman_proposals(cutoff).await?;
+        // 盘压兜底（票 106-stability/07③）：磁盘剩余低于地板时，对**已终态**任务残留的
+        // worktree 先下手。判据与动作分开放——`should_sweep_under_disk_pressure` 是纯函数
+        // （水位由这里读），[`reclaim_terminal_worktrees`] 不看水位，于是两半都能单独测：
+        // 逼出分支不用把 CI 的盘填满，验动作不用伪造磁盘。
+        //
+        // 排在 checkpoint **之前**：那条水位日志该报的是「这次回收之后还剩多少」，
+        // 否则同一份维护读数里，水位与回收量说的是两个时刻的盘。
+        let disk_free = crate::storage::io_budget::disk_free_bytes(&self.store.home().data_dir());
+        let (reclaimed_terminal_worktrees, reclaimed_bytes) =
+            if crate::prune::should_sweep_under_disk_pressure(
+                disk_free,
+                crate::prune::DISK_PRESSURE_FLOOR_BYTES,
+            ) {
+                let swept =
+                    reclaim_terminal_worktrees(&self.store, &*self.sse, self.store.home()).await?;
+                tracing::info!(
+                    disk_free_bytes = disk_free,
+                    reclaimed_worktrees = swept.0,
+                    reclaimed_bytes = swept.1,
+                    "磁盘剩余低于地板，已对终态任务的 worktree 产物下手"
+                );
+                swept
+            } else {
+                (0, 0)
+            };
         // 待办表与其余各表**同一口径**的年龄清理（票 05）：同一个 cutoff，不做第二把尺。
         let purged_attention = self.store.purge_attention(cutoff).await?;
         let aggregated = self.aggregate_node_metrics().await?;
@@ -212,6 +237,8 @@ impl KanbanScheduler {
             expired_foreman_proposals: expired_proposals,
             purged_foreman_proposals: purged_proposals,
             recycled_repair_worktrees: recycled_repairs,
+            reclaimed_terminal_worktrees,
+            reclaimed_bytes,
             purged_attention: purged_attention as usize,
             aggregated_tasks: aggregated,
         })
@@ -1121,6 +1148,46 @@ impl KanbanScheduler {
     }
 }
 
+/// **盘压兜底的动作体**（票 106-stability/07③）：对已落终态任务残留的 worktree 逐个收产物。
+///
+/// 本函数**不读磁盘水位**——要不要调用它，由 [`crate::prune::should_sweep_under_disk_pressure`]
+/// 在 `maintenance` 里判。判据与动作分开，两边才都能单独测：逼出「盘紧了」那条分支不需要
+/// 把 CI 的盘填满，验证动作本身也不需要伪造一个 free 读数。
+///
+/// 只收 [`crate::prune::WORKTREE_ARTIFACT_DIRS`] 点名的产物，**不删 worktree 本身、不删分支**：
+/// 未提交的改动与 `.scratch/` 可能正是人去磁盘上要找的东西，而「删掉整个目录」是 §12.1
+/// 那条终态流程的决定，不是盘压时的应急动作——那种时刻最不该做的是扩大权限。
+/// 返回 `(收过的 worktree 数, 释放字节数)`；每个有读数的工作区各发一条事件（含被拒绝的那些：
+/// 拒绝说明兜底碰到了它管不着的形态，静默的兜底等于没有兜底）。
+pub async fn reclaim_terminal_worktrees(
+    store: &Store,
+    sse: &dyn SseSink,
+    home: &crate::home::Home,
+) -> Result<(usize, u64)> {
+    let mut count = 0usize;
+    let mut freed_bytes = 0u64;
+    for (task_id, worktree) in store.terminal_worktree_paths().await? {
+        let path = std::path::Path::new(&worktree);
+        if !path.is_dir() {
+            // 目录本来就不在（正常收口的常态）：不计数、不报错，也不发一条空事件。
+            continue;
+        }
+        let stats = crate::prune::reclaim_terminal_worktree(home, path).await;
+        crate::pipeline::events::emit_worktree_reclaim(
+            sse,
+            &task_id,
+            crate::types::NodeCursor::BRANCH_MAIN,
+            crate::sse::ReclaimTrigger::Maintenance,
+            &stats,
+        );
+        if stats.freed_bytes > 0 {
+            count += 1;
+            freed_bytes += stats.freed_bytes;
+        }
+    }
+    Ok((count, freed_bytes))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceReport {
     /// 被保留期清掉的**终态任务**会话行（与值班长消息无关——那张表已豁免，票 04）。
@@ -1141,6 +1208,15 @@ pub struct MaintenanceReport {
     /// 那条路同一理由（分支是唯一的证据）。故这个数不为零时，`git branch` 里那些
     /// `repair/*` 仍然在，知道这一点才读得懂这个数。
     pub recycled_repair_worktrees: usize,
+    /// **盘压兜底**回收过的终态 worktree 数（票 106-stability/07③）。
+    ///
+    /// 与上面那项同为「磁盘上的目录」，但不是同一件事：修复那一路删的是整个 worktree
+    /// （分支留着），这一路只收**产物**、目录本身不动——盘压时最不该做的事是扩大权限。
+    /// 恒为 0 有两种读法：盘没紧，或盘紧了但已终态任务都没留下残留——两种都是好事，
+    /// 所以不额外报状态。
+    pub reclaimed_terminal_worktrees: usize,
+    /// 上一项收回的字节数（盘压那条路唯一说得出「这次让盘缓过来多少」的读数）。
+    pub reclaimed_bytes: u64,
     /// 被保留期清掉的值班长待办行（票 05：同一个 `conversation_retention_days` 口径）。
     pub purged_attention: usize,
     pub aggregated_tasks: usize,

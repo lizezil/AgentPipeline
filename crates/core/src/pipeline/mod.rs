@@ -3,7 +3,7 @@
 pub mod advance;
 pub(crate) mod continuation_brief;
 pub mod cursor;
-pub(crate) mod events;
+pub mod events;
 pub mod executor;
 pub mod foreman;
 pub mod foreman_actions;

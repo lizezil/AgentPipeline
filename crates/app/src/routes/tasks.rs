@@ -530,19 +530,48 @@ pub async fn retry(
 ///
 /// 幂等——§12.1"worktree 已不存在时跳过删除，不报错"；清理失败只告警，
 /// 不改变已落定的终态。
-async fn cleanup_worktree_and_branch(state: &AppState, task_id: &str) {
+///
+/// 票 106-stability/07①：产物回收排在**取项目之前**。项目行没了 / 主仓路径失效，
+/// 正是 `remove_worktree` 跑不动的那种形态（106 上那个 2.8GB 的 cancelled 残留就是这么
+/// 留下的），而那不等于「这些字节可以继续吃盘」。回收本身不返回错误，失败只在读数里。
+async fn cleanup_worktree_and_branch(
+    state: &AppState,
+    task_id: &str,
+    trigger: agentpipeline_core::sse::ReclaimTrigger,
+) {
     let Ok(task) = state.store.get_task(task_id).await else {
         return;
     };
     let Some(worktree) = task.worktree_path else {
         return;
     };
+    let wt = std::path::Path::new(&worktree);
+    if wt.is_dir() {
+        let stats = agentpipeline_core::prune::reclaim_terminal_worktree(&state.home, wt).await;
+        if stats.worth_reporting() {
+            tracing::info!(
+                task = task_id,
+                freed_bytes = stats.freed_bytes,
+                target_bytes = stats.bytes_of("target"),
+                rows_bytes = stats.bytes_of(".rows"),
+                uncommitted = stats.uncommitted.len(),
+                "{}",
+                stats.summary_line()
+            );
+        }
+        agentpipeline_core::pipeline::events::emit_worktree_reclaim(
+            &*state.sse,
+            task_id,
+            NodeCursor::BRANCH_MAIN,
+            trigger,
+            &stats,
+        );
+    }
     let Ok(project) = state.store.get_project(&task.project_id).await else {
         return;
     };
     let Some(project) = project else { return };
     let repo = std::path::Path::new(&project.local_path);
-    let wt = std::path::Path::new(&worktree);
     if wt.exists() {
         if let Err(e) = Git.remove_worktree(repo, wt, true).await {
             tracing::warn!(task = task_id, error = %e, "worktree 清理失败");
@@ -563,7 +592,7 @@ pub async fn cancel(
 ) -> ApiResult<impl IntoResponse> {
     let notified = state.store.cancel_task(&id).await.map_err(map_core_error)?;
     // §12.1 取消流程 ③④：强制清理 worktree 与分支
-    cleanup_worktree_and_branch(&state, &id).await;
+    cleanup_worktree_and_branch(&state, &id, agentpipeline_core::sse::ReclaimTrigger::Cancel).await;
     // 通知依赖任务（§12.3）
     for dependent in &notified {
         state
@@ -610,7 +639,12 @@ pub async fn archive(
         return Err(ApiError::bad_request("只有终态任务可以归档"));
     }
     // git.rs 的回收策略（决策 3）：取消 / 归档同样清理 worktree 与分支
-    cleanup_worktree_and_branch(&state, &id).await;
+    cleanup_worktree_and_branch(
+        &state,
+        &id,
+        agentpipeline_core::sse::ReclaimTrigger::Archive,
+    )
+    .await;
     state
         .store
         .archive_task(&id)
@@ -670,6 +704,31 @@ pub async fn split(
             .await
             .map_err(map_core_error)?;
         created.push(task.id);
+    }
+    // 票 106-stability/07：拆分把原任务落成 cancelled，而这条路**原本连清理都不走**
+    // ——`cleanup_worktree_and_branch` 只在取消 / 归档里被调，拆完的原 worktree 是
+    // 一条明确的漏盘口（106 那个 2.8GB 残留的同族形态）。本票的边界是「收产物、不动 git」，
+    // 所以这里只收产物：删 worktree / 删分支要不要一起接上，是 §12.1 那条口径的事，
+    // 不在本票范围内擅自扩。
+    let original_worktree = state
+        .store
+        .get_task(&id)
+        .await
+        .ok()
+        .and_then(|t| t.worktree_path)
+        .map(std::path::PathBuf::from);
+    if let Some(wt) = original_worktree.filter(|wt| wt.is_dir()) {
+        let stats = agentpipeline_core::prune::reclaim_terminal_worktree(&state.home, &wt).await;
+        if stats.worth_reporting() {
+            tracing::info!(task = %id, freed_bytes = stats.freed_bytes, "{}", stats.summary_line());
+        }
+        agentpipeline_core::pipeline::events::emit_worktree_reclaim(
+            &*state.sse,
+            &id,
+            NodeCursor::BRANCH_MAIN,
+            agentpipeline_core::sse::ReclaimTrigger::Split,
+            &stats,
+        );
     }
     state
         .store
